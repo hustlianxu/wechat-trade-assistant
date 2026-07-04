@@ -12,6 +12,11 @@
 打包后整个 dist-python 目录由 electron-builder 作为 extraResources 复制进
 应用的 resources/backend-runtime，由 electron/python_runner.ts 在生产态启动。
 
+入口说明：
+    使用 launcher.py 而非 main.py 作为入口。main.py 用了相对导入
+    (from .api.routes import)，作为顶层脚本执行会报 ImportError。
+    launcher.py 先把 src/ 加入 sys.path，再用绝对导入调用 backend.main.run()。
+
 使用：
     cd <项目根>
     pyinstaller installers/backend.spec --noconfirm \\
@@ -43,7 +48,7 @@ datas = [
 ]
 
 a = Analysis(
-    ['../src/backend/main.py'],
+    ['../src/backend/launcher.py'],
     pathex=['../src'],
     binaries=[],
     datas=datas,
