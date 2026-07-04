@@ -222,16 +222,67 @@ def to_message_model(parsed: ParsedMessage, contact_id: int) -> Message:
 # ----------------------------------------------------------------------------
 # 打开解密连接
 # ----------------------------------------------------------------------------
+def _find_sqlcipher_binary() -> Optional[str]:
+    """查找可用的 sqlcipher 二进制。
+
+    优先级：
+    1. 随应用打包的 bin/<platform>/sqlcipher（打包态）
+    2. 系统 PATH 中的 sqlcipher（开发态或用户已安装）
+    """
+    import shutil
+    import sys
+
+    # 1. 打包态：bin/<platform>/sqlcipher
+    try:
+        from ..config import get_bin_dir
+        bin_dir = get_bin_dir()
+        if sys.platform == "win32":
+            candidates = [
+                bin_dir / "windows" / "sqlcipher.exe",
+                bin_dir / "win" / "sqlcipher.exe",
+                bin_dir / "sqlcipher.exe",
+            ]
+        elif sys.platform == "darwin":
+            candidates = [
+                bin_dir / "macos" / "sqlcipher",
+                bin_dir / "mac" / "sqlcipher",
+                bin_dir / "darwin" / "sqlcipher",
+                bin_dir / "sqlcipher",
+            ]
+        else:
+            candidates = [
+                bin_dir / "linux" / "sqlcipher",
+                bin_dir / "sqlcipher",
+            ]
+        for c in candidates:
+            if c.exists() and c.is_file():
+                # 确保有执行权限
+                try:
+                    import os as _os
+                    _os.chmod(str(c), 0o755)
+                except Exception:
+                    pass
+                return str(c)
+    except Exception:
+        pass
+
+    # 2. 系统 PATH
+    found = shutil.which("sqlcipher")
+    if found:
+        return found
+    return None
+
+
 def is_sqlcipher_available() -> bool:
     """检测 SQLCipher 解密能力是否可用。"""
+    # 优先 pysqlcipher3（Python 原生，性能最好）
     try:
         from pysqlcipher3 import dbapi2  # noqa: F401
         return True
     except ImportError:
         pass
-    # 检查 sqlcipher CLI
-    import shutil
-    return shutil.which("sqlcipher") is not None
+    # 检查打包的或系统的 sqlcipher CLI
+    return _find_sqlcipher_binary() is not None
 
 
 def open_decrypted_db(
@@ -246,7 +297,8 @@ def open_decrypted_db(
         key: 32 字节密钥
         sqlcipher_compatibility: 3 或 4
 
-    需要 pysqlcipher3 或系统 sqlcipher CLI。沙箱环境若都不可用会抛 RuntimeError。
+    优先用 pysqlcipher3（性能最好），回退到 sqlcipher CLI。
+    打包态会自动查找随应用分发的 sqlcipher 二进制。
     """
     # 优先 pysqlcipher3（Python 原生连接，性能最好）
     try:
@@ -267,7 +319,7 @@ def open_decrypted_db(
         conn.row_factory = sqlite3.Row
         return conn
 
-    # 回退：用系统 sqlcipher CLI 把加密库导出为明文临时库
+    # 回退：用 sqlcipher CLI（打包的或系统的）把加密库导出为明文临时库
     return _open_via_sqlcipher_cli(db_path, key, sqlcipher_compatibility)
 
 
@@ -278,17 +330,21 @@ def _open_via_sqlcipher_cli(
 ) -> sqlite3.Connection:
     """用 sqlcipher CLI 解密数据库到临时文件，再用 sqlite3 打开。
 
-    适用于没有 pysqlcipher3 但系统装了 sqlcipher 的环境。
+    优先用随应用打包的 sqlcipher 二进制，其次系统 PATH。
     """
     import os
-    import shutil
     import tempfile
 
-    sqlcipher_bin = shutil.which("sqlcipher")
+    sqlcipher_bin = _find_sqlcipher_binary()
     if sqlcipher_bin is None:
         raise RuntimeError(
-            "未安装 pysqlcipher3，且系统无 sqlcipher 命令，无法解密微信数据库。"
-            "请执行 pip install pysqlcipher3，或安装 sqlcipher（macOS: brew install sqlcipher）。"
+            "未安装 pysqlcipher3，且未找到 sqlcipher 二进制（打包态或系统均无），"
+            "无法解密微信数据库。\n"
+            "解决方案：\n"
+            "1. 重新打包（构建脚本会自动下载 sqlcipher 二进制到 bin/）\n"
+            "2. 或手动安装：macOS 执行 brew install sqlcipher；"
+            "Windows 从 https://github.com/sqlcipher/sqlcipher/releases 下载\n"
+            "3. 或执行 pip install pysqlcipher3"
         )
 
     # 用 sqlcipher CLI 导出明文库
