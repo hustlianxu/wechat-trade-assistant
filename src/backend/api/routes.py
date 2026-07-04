@@ -794,16 +794,75 @@ def _decrypt_with_multi_keys(
             message="未找到微信数据目录，请确认微信已登录或手动指定数据目录",
         )
 
-    # 选择第一个数据目录（如果有 wxid 则匹配）
-    data_dir = data_dirs[0]
+    # 选择数据目录：优先按 wxid 匹配，否则遍历所有候选找含 .db 文件的目录
+    # 注意：find_wechat_data_dirs 可能返回父目录（如 base_3x 容器根），
+    # 父目录会 rglob 出多个账号的 .db，导致 find_db_for_key 按 JSON 相对路径
+    # 匹配失败。因此必须选「账号根目录」——直接含 message/ 或 Msg/ 子目录的那个。
+    from pathlib import Path
+
+    def _is_account_root(d: Path) -> bool:
+        """判断目录是否为账号根目录（直接含 message/ 或 Msg/ 子目录）。"""
+        return (d / "message").is_dir() or (d / "Msg").is_dir()
+
+    def _scan_dbs(d: Path) -> dict:
+        try:
+            return find_all_dbs(version_info, d)
+        except Exception:
+            return {}
+
+    data_dir = None
+    all_dbs: dict = {}
+
+    # 1) wxid 匹配：在账号根目录中找名字含 wxid 的
     if wxid:
         for d in data_dirs:
+            if not _is_account_root(d):
+                continue
             if d.name == wxid or wxid in str(d):
-                data_dir = d
-                break
+                dbs = _scan_dbs(d)
+                if dbs:
+                    data_dir = d
+                    all_dbs = dbs
+                    break
 
-    # 找出所有 .db 文件
-    all_dbs = find_all_dbs(version_info, data_dir)
+    # 2) 优先选账号根目录中含最多 .db 的；没有账号根目录才退回到任意候选
+    if data_dir is None:
+        best_dir = None
+        best_dbs: dict = {}
+        for d in data_dirs:
+            if not _is_account_root(d):
+                continue
+            dbs = _scan_dbs(d)
+            if len(dbs) > len(best_dbs):
+                best_dir = d
+                best_dbs = dbs
+        if best_dir is not None and best_dbs:
+            data_dir = best_dir
+            all_dbs = best_dbs
+
+    # 3) 兜底：在所有候选（含父目录）中找含 db 最多的
+    if data_dir is None:
+        for d in data_dirs:
+            dbs = _scan_dbs(d)
+            if len(dbs) > len(best_dbs):
+                best_dir = d
+                best_dbs = dbs
+        if best_dir is not None and best_dbs:
+            data_dir = best_dir
+            all_dbs = best_dbs
+
+    if data_dir is None or not all_dbs:
+        # 所有候选目录都没有 db 文件
+        tried_paths = "; ".join(str(d) for d in data_dirs[:5])
+        return schemas.DecryptTriggerResponse(
+            ok=False,
+            message=(
+                f"在 {len(data_dirs)} 个候选数据目录下均未找到 .db 文件。"
+                f"已尝试：{tried_paths}。"
+                "请在设置页『微信数据目录（手动指定）』填入正确的账号目录绝对路径"
+                "（应包含 message/、contact/ 等子目录）。"
+            ),
+        )
 
     db_results: List[schemas.DecryptDbResult] = []
     total_msg_count = 0
@@ -817,8 +876,14 @@ def _decrypt_with_multi_keys(
     for rel_path, key_entry in contact_db_keys.items():
         db_path = find_db_for_key(all_dbs, rel_path)
         if db_path is None or not db_path.exists():
+            # 给出诊断信息：实际数据目录下有哪些 .db 文件
+            available = list(all_dbs.keys())[:10]
             db_results.append(schemas.DecryptDbResult(
-                db_path=rel_path, ok=False, message="数据库文件未找到"
+                db_path=rel_path, ok=False,
+                message=(
+                    f"数据库文件未找到。数据目录：{data_dir}。"
+                    f"该目录下找到的 .db 文件（前 10 个）：{available}"
+                ),
             ))
             continue
         try:
@@ -846,8 +911,13 @@ def _decrypt_with_multi_keys(
     for rel_path, key_entry in msg_db_keys.items():
         db_path = find_db_for_key(all_dbs, rel_path)
         if db_path is None or not db_path.exists():
+            available = list(all_dbs.keys())[:10]
             db_results.append(schemas.DecryptDbResult(
-                db_path=rel_path, ok=False, message="数据库文件未找到"
+                db_path=rel_path, ok=False,
+                message=(
+                    f"数据库文件未找到。数据目录：{data_dir}。"
+                    f"该目录下找到的 .db 文件（前 10 个）：{available}"
+                ),
             ))
             continue
         try:
