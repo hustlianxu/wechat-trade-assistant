@@ -57,6 +57,13 @@ function chmodRecursive(dir: string, mode: number): void {
 }
 
 // 生产态：解析 PyInstaller 产出的后端可执行文件路径
+// PyInstaller COLLECT 模式产出结构：
+//   dist-python/wta-backend/wta-backend       (macOS/Linux 可执行文件)
+//   dist-python/wta-backend/_internal/        (依赖)
+// electron-builder extraResources 把 dist-python 复制为 backend-runtime，因此实际：
+//   backend-runtime/wta-backend/wta-backend   ← 真正的可执行文件
+// 但若用户用 --onedir 根目录或自定义布局，也可能直接是 backend-runtime/wta-backend。
+// 本函数智能探测：优先找文件，其次找目录下的同名可执行文件。
 function resolveProductionEnv(): {
   command: string;
   args: string[];
@@ -69,14 +76,49 @@ function resolveProductionEnv(): {
   const modelsDir = path.join(resources, 'models');
   const binDir = path.join(resources, 'bin');
 
-  const command = process.platform === 'win32'
-    ? path.join(runtimeDir, 'wta-backend.exe')
-    : path.join(runtimeDir, 'wta-backend');
+  const exeName = process.platform === 'win32' ? 'wta-backend.exe' : 'wta-backend';
+  const directPath = path.join(runtimeDir, exeName);
+  const nestedPath = path.join(runtimeDir, 'wta-backend', exeName);
+
+  let command: string;
+  // 优先：directPath 是文件（非目录）→ 直接用
+  if (fs.existsSync(directPath) && fs.statSync(directPath).isFile()) {
+    command = directPath;
+  } else if (fs.existsSync(nestedPath) && fs.statSync(nestedPath).isFile()) {
+    // 其次：PyInstaller COLLECT 嵌套结构 wta-backend/wta-backend
+    command = nestedPath;
+  } else {
+    // 兜底：扫描 runtimeDir 下任意位置找 wta-backend 可执行文件
+    let found: string | null = null;
+    function scanDir(dir: string, depth: number): void {
+      if (found || depth > 3 || !fs.existsSync(dir)) return;
+      for (const name of fs.readdirSync(dir)) {
+        const full = path.join(dir, name);
+        try {
+          const stat = fs.statSync(full);
+          if (stat.isFile() && name === exeName) {
+            found = full;
+            return;
+          }
+          if (stat.isDirectory() && !name.startsWith('.')) {
+            scanDir(full, depth + 1);
+          }
+        } catch {
+          // 忽略权限错误
+        }
+      }
+    }
+    scanDir(runtimeDir, 0);
+    command = found || nestedPath; // 找不到仍用 nestedPath 让报错信息可读
+  }
+
+  // cwd 设为可执行文件所在目录，便于 PyInstaller 找到 _internal/
+  const commandDir = path.dirname(command);
 
   return {
     command,
     args: [],
-    cwd: runtimeDir,
+    cwd: commandDir,
     env: {
       ...process.env,
       WTA_MODELS_DIR: modelsDir,
@@ -105,7 +147,11 @@ function ensureExecutable(filePath: string): boolean {
   try {
     if (!fs.existsSync(filePath)) return false;
     const stat = fs.statSync(filePath);
-    // 检查当前权限是否已有 owner execute
+    // 关键：必须是文件，不能是目录。目录权限 0o755 不代表可执行
+    if (stat.isDirectory()) {
+      console.error(`[python] 路径是目录而非可执行文件: ${filePath}`);
+      return false;
+    }
     const hasExec = (stat.mode & 0o100) !== 0;
     if (!hasExec) {
       fs.chmodSync(filePath, 0o755);
