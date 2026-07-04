@@ -1,4 +1,4 @@
-import { app, BrowserWindow, shell, dialog, MessageDialogOptions, MessageBoxReturnValue } from 'electron';
+import { app, BrowserWindow, shell, dialog } from 'electron';
 import * as path from 'path';
 import { startPythonBackend, stopPythonBackend } from './python_runner';
 import {
@@ -36,7 +36,7 @@ async function resolvePortConflict(): Promise<number> {
     ? `进程 PID=${proc.pid}${proc.name ? `（${proc.name}）` : ''}\n${proc.command || ''}`
     : '（无法获取占用进程信息）';
 
-  const options: MessageDialogOptions = {
+  const options: Electron.MessageBoxOptions = {
     type: 'warning',
     title: '端口被占用',
     message: `默认端口 ${DEFAULT_PORT} 已被占用`,
@@ -51,7 +51,7 @@ async function resolvePortConflict(): Promise<number> {
   };
 
   // 需要在 app ready 后才能弹对话框
-  const choice: number = await dialog.showMessageBox(options).then((r: MessageBoxReturnValue) => r.response);
+  const choice: number = await dialog.showMessageBox(options).then((r) => r.response);
 
   if (choice === 2) {
     // 退出
