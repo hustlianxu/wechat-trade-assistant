@@ -310,24 +310,54 @@ def find_all_dbs(version: WeChatVersionInfo, data_dir: Path) -> dict[str, Path]:
 
 
 def find_db_for_key(all_dbs: dict[str, Path], db_rel_path: str) -> Optional[Path]:
-    """根据 JSON 中的相对路径查找实际数据库文件，大小写不敏感。
+    """根据 JSON 中的相对路径查找实际数据库文件。
 
-    微信 4.0.x 在不同平台/版本下路径大小写可能不同（如 Message/Message_0.db
-    vs message/message_0.db），而 SQLCipher 密钥与路径内容无关，因此做大小写
-    不敏感匹配以提高兼容性。
+    匹配策略（逐级放宽）：
+    1. 精确相对路径匹配
+    2. 大小写不敏感的相对路径匹配（Message/Message_0.db ↔ message/message_0.db）
+    3. 仅按 basename 匹配（message_0.db ↔任意目录下的 Message_0.db）
+       —— 用于 Mac 从 3.x 升级到 4.0 后目录结构不一致的场景
+    4. 3.x ↔ 4.x 文件名等价映射（contact.db ↔ wccontact_new2.db 等）
+       —— Mac 3.x 升级到 4.0 后，部分库仍沿用 3.x 文件名
+
+    SQLCipher 密钥与文件路径内容无关，因此可以做宽松匹配。
+    注意：策略 4 仅在文件名不同时尝试，密钥能否真正解密取决于微信版本
+    是否对同一逻辑库使用了相同主密钥派生。
     """
     if not db_rel_path:
         return None
     normalized = db_rel_path.replace("\\", "/").lstrip("./")
-    # 精确匹配
+    # 1. 精确匹配
     if normalized in all_dbs:
         return all_dbs[normalized]
-    # 大小写不敏感匹配
+    # 2. 大小写不敏感的相对路径匹配
     lower = normalized.lower()
     for rel, abs_path in all_dbs.items():
         if rel.lower() == lower:
             return abs_path
+    # 3. 仅按 basename 匹配（兜底）
+    basename = lower.rsplit("/", 1)[-1]
+    for rel, abs_path in all_dbs.items():
+        actual_basename = rel.replace("\\", "/").lower().rsplit("/", 1)[-1]
+        if actual_basename == basename:
+            return abs_path
+    # 4. 3.x ↔ 4.x 文件名等价映射
+    for equiv in _3X_4X_NAME_EQUIV.get(basename, []):
+        for rel, abs_path in all_dbs.items():
+            actual_basename = rel.replace("\\", "/").lower().rsplit("/", 1)[-1]
+            if actual_basename == equiv:
+                return abs_path
     return None
+
+
+# 3.x ↔ 4.x 文件名等价表（key 为 4.x 小写 basename，value 为 3.x 等价 basename 列表）
+# Mac 从 3.x 升级到 4.0 后，部分库仍沿用 3.x 文件名，但密钥 JSON 可能用 4.x 名。
+_3X_4X_NAME_EQUIV: dict[str, list[str]] = {
+    "contact.db": ["wccontact_new2.db", "micromsg.db"],
+    "contact_fts.db": ["wccontact_new2_fts.db"],
+    "session.db": ["session_new.db"],
+    "sns.db": ["sns.db"],
+}
 
 
 def find_micro_msg_db(version: WeChatVersionInfo, data_dir: Path) -> Optional[Path]:

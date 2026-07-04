@@ -794,15 +794,23 @@ def _decrypt_with_multi_keys(
             message="未找到微信数据目录，请确认微信已登录或手动指定数据目录",
         )
 
-    # 选择数据目录：优先按 wxid 匹配，否则遍历所有候选找含 .db 文件的目录
-    # 注意：find_wechat_data_dirs 可能返回父目录（如 base_3x 容器根），
-    # 父目录会 rglob 出多个账号的 .db，导致 find_db_for_key 按 JSON 相对路径
-    # 匹配失败。因此必须选「账号根目录」——直接含 message/ 或 Msg/ 子目录的那个。
+    # 收集所有候选数据目录的 .db 文件索引。
+    # 注意：find_wechat_data_dirs 可能返回父目录（如 base_3x 容器根）和账号根目录。
+    # 父目录会 rglob 出多个账号的 .db，相对路径不匹配 JSON key，因此：
+    # - 优先在「账号根目录」（直接含 message/ 或 Msg/）中查找
+    # - 对每个 JSON key，依次在所有账号目录中查找，找到即用
     from pathlib import Path
 
     def _is_account_root(d: Path) -> bool:
-        """判断目录是否为账号根目录（直接含 message/ 或 Msg/ 子目录）。"""
-        return (d / "message").is_dir() or (d / "Msg").is_dir()
+        """判断目录是否为账号根目录（直接含 message/ 或 Msg/ 子目录）。
+
+        macOS 大小写不敏感文件系统上，message 和 Message 可能是同一目录，
+        但目录名保留创建时的大小写，因此同时检查大小写两种形式。
+        """
+        for name in ("message", "Message", "Msg", "MSG"):
+            if (d / name).is_dir():
+                return True
+        return False
 
     def _scan_dbs(d: Path) -> dict:
         try:
@@ -810,49 +818,28 @@ def _decrypt_with_multi_keys(
         except Exception:
             return {}
 
-    data_dir = None
-    all_dbs: dict = {}
+    # 按优先级收集所有候选目录的 db 索引：账号根目录在前，父目录在后
+    account_dirs: list[tuple[Path, dict]] = []
+    parent_dirs: list[tuple[Path, dict]] = []
+    for d in data_dirs:
+        dbs = _scan_dbs(d)
+        if not dbs:
+            continue
+        if _is_account_root(d):
+            account_dirs.append((d, dbs))
+        else:
+            parent_dirs.append((d, dbs))
 
-    # 1) wxid 匹配：在账号根目录中找名字含 wxid 的
-    if wxid:
-        for d in data_dirs:
-            if not _is_account_root(d):
-                continue
-            if d.name == wxid or wxid in str(d):
-                dbs = _scan_dbs(d)
-                if dbs:
-                    data_dir = d
-                    all_dbs = dbs
-                    break
+    # 排序：账号目录按 db 数量降序（多的优先）；wxid 匹配的排最前
+    def _dir_sort_key(item: tuple[Path, dict]) -> tuple:
+        d, dbs = item
+        wxid_match = 1 if (wxid and (d.name == wxid or wxid in str(d))) else 0
+        return (-wxid_match, -len(dbs))
 
-    # 2) 优先选账号根目录中含最多 .db 的；没有账号根目录才退回到任意候选
-    if data_dir is None:
-        best_dir = None
-        best_dbs: dict = {}
-        for d in data_dirs:
-            if not _is_account_root(d):
-                continue
-            dbs = _scan_dbs(d)
-            if len(dbs) > len(best_dbs):
-                best_dir = d
-                best_dbs = dbs
-        if best_dir is not None and best_dbs:
-            data_dir = best_dir
-            all_dbs = best_dbs
+    account_dirs.sort(key=_dir_sort_key)
+    all_search_dirs = account_dirs + parent_dirs
 
-    # 3) 兜底：在所有候选（含父目录）中找含 db 最多的
-    if data_dir is None:
-        for d in data_dirs:
-            dbs = _scan_dbs(d)
-            if len(dbs) > len(best_dbs):
-                best_dir = d
-                best_dbs = dbs
-        if best_dir is not None and best_dbs:
-            data_dir = best_dir
-            all_dbs = best_dbs
-
-    if data_dir is None or not all_dbs:
-        # 所有候选目录都没有 db 文件
+    if not all_search_dirs:
         tried_paths = "; ".join(str(d) for d in data_dirs[:5])
         return schemas.DecryptTriggerResponse(
             ok=False,
@@ -864,6 +851,18 @@ def _decrypt_with_multi_keys(
             ),
         )
 
+    # 主数据目录（用于诊断信息展示）
+    data_dir = all_search_dirs[0][0]
+    all_dbs = all_search_dirs[0][1]
+
+    def _find_db_anywhere(rel_path: str) -> Optional[Path]:
+        """在所有候选数据目录中查找 db 文件，返回第一个匹配的绝对路径。"""
+        for _d, dbs in all_search_dirs:
+            p = find_db_for_key(dbs, rel_path)
+            if p and p.exists():
+                return p
+        return None
+
     db_results: List[schemas.DecryptDbResult] = []
     total_msg_count = 0
     total_contact_count = 0
@@ -871,19 +870,26 @@ def _decrypt_with_multi_keys(
     # wxid → contact_id 映射，跨库复用
     wxid_to_id: dict[str, int] = {c.wxid: c.id for c in repo.list_contacts() if c.id}
 
+    def _not_found_msg(rel_path: str) -> str:
+        """构造「数据库文件未找到」的诊断信息：显示全部 .db 文件 + basename 模糊匹配。"""
+        basename = rel_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        parts = []
+        for d, dbs in all_search_dirs:
+            all_files = list(dbs.keys())
+            fuzzy = [k for k in all_files if k.replace("\\", "/").rsplit("/", 1)[-1].lower() == basename]
+            parts.append(
+                f"目录 {d}（{len(all_files)} 个 .db）：{all_files}；"
+                f"按文件名 '{basename}' 模糊匹配：{fuzzy or '无'}"
+            )
+        return "数据库文件未找到。" + " | ".join(parts)
+
     # 先解密联系人库
     contact_db_keys = {k: v for k, v in multi_keys.items() if "contact" in k.lower()}
     for rel_path, key_entry in contact_db_keys.items():
-        db_path = find_db_for_key(all_dbs, rel_path)
+        db_path = _find_db_anywhere(rel_path)
         if db_path is None or not db_path.exists():
-            # 给出诊断信息：实际数据目录下有哪些 .db 文件
-            available = list(all_dbs.keys())[:10]
             db_results.append(schemas.DecryptDbResult(
-                db_path=rel_path, ok=False,
-                message=(
-                    f"数据库文件未找到。数据目录：{data_dir}。"
-                    f"该目录下找到的 .db 文件（前 10 个）：{available}"
-                ),
+                db_path=rel_path, ok=False, message=_not_found_msg(rel_path),
             ))
             continue
         try:
@@ -909,15 +915,10 @@ def _decrypt_with_multi_keys(
     # 再解密消息库（所有 message_*.db）
     msg_db_keys = {k: v for k, v in multi_keys.items() if "message" in k.lower() and "fts" not in k.lower() and "biz" not in k.lower()}
     for rel_path, key_entry in msg_db_keys.items():
-        db_path = find_db_for_key(all_dbs, rel_path)
+        db_path = _find_db_anywhere(rel_path)
         if db_path is None or not db_path.exists():
-            available = list(all_dbs.keys())[:10]
             db_results.append(schemas.DecryptDbResult(
-                db_path=rel_path, ok=False,
-                message=(
-                    f"数据库文件未找到。数据目录：{data_dir}。"
-                    f"该目录下找到的 .db 文件（前 10 个）：{available}"
-                ),
+                db_path=rel_path, ok=False, message=_not_found_msg(rel_path),
             ))
             continue
         try:
