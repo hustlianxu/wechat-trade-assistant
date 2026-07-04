@@ -1,0 +1,77 @@
+{
+  "name": "wechat-trade-assistant-ui",
+  "version": "1.0.0",
+  "description": "南美外贸微信智能助手桌面端 UI",
+  "main": "electron/main.js",
+  "author": "WTA",
+  "license": "MIT",
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"tsc -p tsconfig.node.json && wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "build": "vite build && tsc -p tsconfig.node.json",
+    "preview": "vite preview",
+    "dist": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.1",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.wta.app",
+    "productName": "WeChat Trade Assistant",
+    "files": [
+      "dist/**",
+      "electron/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist-python",
+        "to": "backend-runtime",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../models",
+        "to": "models",
+        "filter": ["**/*"],
+        "optional": true
+      },
+      {
+        "from": "../bin",
+        "to": "bin",
+        "filter": ["**/*"],
+        "optional": true
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.business",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
+  }
+}

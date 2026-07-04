@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Electron / Vite
+node_modules/
+ui/dist/
+ui/out/
+release/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 本地数据（绝不入库）
+data/local.db
+data/local.db-*
+data/cache/
+data/attachments/
+data/audio/
+*.dat
+*.sqlite
+*.sqlite-journal
+
+# 模型文件（按需下载，不入库）
+models/whisper/*.bin
+models/whisper/*.gguf
+models/intent/*.bin
+models/intent/*.safetensors
+models/intent/*.onnx
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 打包产物
+installers/dist/
+installers/build/
+*.dmg
+*.exe
+*.app

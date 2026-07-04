@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "skipLibCheck": true,
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "target": "ES2020",
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "outDir": "./electron",
+    "rootDir": "./electron",
+    "declaration": false,
+    "types": ["node"]
+  },
+  "include": ["electron/**/*.ts"]
+}
