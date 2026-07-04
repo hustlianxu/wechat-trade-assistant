@@ -58,6 +58,7 @@
         ]
       }
     ],
+    "afterPack": "./afterPack.js",
     "mac": {
       "category": "public.app-category.business",
       "target": [
