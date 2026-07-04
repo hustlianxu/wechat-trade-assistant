@@ -167,57 +167,77 @@ def find_wechat_data_dirs(version: WeChatVersionInfo) -> list[Path]:
                 candidates.append(docs)
     elif plat == Platform.MACOS:
         home = Path.home()
-        # macOS 沙盒路径（3.x 经典版 / 4.0 共用同一 container）
+        lib = home / "Library"
+
+        # 4.x 数据库文件出现的所有可能根目录（按优先级）
+        # 微信 4.0 Mac 版本可能使用以下任一路径存储 4.x 结构数据
+        _mac_4x_roots: list[Path] = [
+            # 1) 新 container（com.tencent.WeChat，注意大小写）
+            lib / "Containers" / "com.tencent.WeChat" / "Data",
+            # 2) Group Containers（App Group 共享容器，4.0 常用）
+            #    team_id 前缀未定，用 glob 在运行时发现
+            # 3) 非沙盒 Application Support
+            lib / "Application Support" / "com.tencent.xWeChat",
+            lib / "Application Support" / "com.tencent.WeChat",
+            lib / "Application Support" / "WeChat",
+            # 4) xwechat 命名（与 Windows 一致）
+            lib / "Application Support" / "xwechat_files",
+            # 5) 旧 container（3.x 经典版，4.0 可能复用）
+            lib / "Containers" / "com.tencent.xinWeChat" / "Data" / "Library" /
+            "Application Support" / "com.tencent.xinWeChat",
+        ]
+
+        # Group Containers 动态发现（team_id 未知，用 glob）
+        group_dir = lib / "Group Containers"
+        if group_dir.is_dir():
+            for sub in group_dir.iterdir():
+                if sub.is_dir() and (
+                    "tencent" in sub.name.lower()
+                    and ("wechat" in sub.name.lower() or "xinwechat" in sub.name.lower())
+                ):
+                    _mac_4x_roots.append(sub)
+
+        # 在每个根目录下扫描 4.x 结构账号目录
+        # 4.x 标志：含 message/message_0.db（小写 message 目录 + message_N.db 文件名）
+        seen_4x_account_dirs: set[str] = set()
+        for root in _mac_4x_roots:
+            if not root.exists():
+                continue
+            # rglob 找 message_*.db（4.x 文件名），其父目录的父目录是账号根目录
+            try:
+                for db_file in root.rglob("message_*.db"):
+                    if not db_file.is_file():
+                        continue
+                    # 过滤：只认 message/message_N.db 结构（父目录名小写 message）
+                    parent_name = db_file.parent.name.lower()
+                    if parent_name != "message":
+                        continue
+                    account_dir = db_file.parent.parent
+                    key = str(account_dir)
+                    if key not in seen_4x_account_dirs:
+                        seen_4x_account_dirs.add(key)
+                        candidates.append(account_dir)
+            except (PermissionError, OSError):
+                continue
+
+        # 3.x 结构目录（兼容旧数据）：含 Message/ 或 Msg/ 子目录
         base_3x = (
-            home
-            / "Library"
-            / "Containers"
-            / "com.tencent.xinWeChat"
-            / "Data"
-            / "Library"
-            / "Application Support"
-            / "com.tencent.xinWeChat"
+            lib / "Containers" / "com.tencent.xinWeChat" / "Data" /
+            "Library" / "Application Support" / "com.tencent.xinWeChat"
         )
         if base_3x.exists():
-            # 2.0b4.0.9 这种子目录结构（3.x）
             for sub in base_3x.rglob("message"):
                 if sub.is_dir():
                     candidates.append(sub.parent)
-            # 4.0 的 message/message_0.db 结构也在这个 container 下
-            # message_*.db 的父目录是 message/，再上一级才是账号根目录
-            seen_4x_dirs: set[str] = set()
-            for sub in base_3x.rglob("message_*.db"):
-                account_dir = sub.parent.parent
-                key = str(account_dir)
-                if key not in seen_4x_dirs:
-                    seen_4x_dirs.add(key)
-                    candidates.append(account_dir)
+            for sub in base_3x.rglob("Message"):
+                if sub.is_dir():
+                    candidates.append(sub.parent)
             candidates.append(base_3x)
-        # 4.0 在 Mac 上的非沙盒路径
-        base_4x = home / "Library" / "Application Support" / "com.tencent.xWeChat"
-        if base_4x.exists():
-            for sub in base_4x.iterdir():
-                if sub.is_dir() and (sub / "message").exists():
-                    candidates.append(sub)
-            candidates.append(base_4x)
-        # 4.0 另一种 container 路径
-        base_4x_alt = home / "Library" / "Containers" / "com.tencent.WeChat"
-        if base_4x_alt.exists():
-            seen_alt: set[str] = set()
-            for sub in base_4x_alt.rglob("message_*.db"):
-                account_dir = sub.parent.parent
-                key = str(account_dir)
-                if key not in seen_alt:
-                    seen_alt.add(key)
-                    candidates.append(account_dir)
-            candidates.append(base_4x_alt)
-        # 4.0 xwechat 命名（与 Windows 一致）
-        base_xwechat = home / "Library" / "Application Support" / "xwechat_files"
-        if base_xwechat.exists():
-            for sub in base_xwechat.iterdir():
-                if sub.is_dir() and (sub / "message").exists():
-                    candidates.append(sub)
-            candidates.append(base_xwechat)
+
+        # 各 4.x 根目录本身也加入候选（兜底，让上层 rglob 搜索）
+        for root in _mac_4x_roots:
+            if root.exists():
+                candidates.append(root)
     elif plat == Platform.LINUX:
         candidates.append(Path.home() / ".config" / "WeChat")
 
