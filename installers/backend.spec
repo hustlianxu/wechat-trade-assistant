@@ -39,12 +39,12 @@ hiddenimports += [
 
 # 数据文件：schema.sql 必须随包
 datas = [
-    ('src/backend/storage/schema.sql', 'backend/storage'),
+    ('../src/backend/storage/schema.sql', 'backend/storage'),
 ]
 
 a = Analysis(
-    ['src/backend/main.py'],
-    pathex=['src'],
+    ['../src/backend/main.py'],
+    pathex=['../src'],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,

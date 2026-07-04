@@ -2,7 +2,7 @@
   "name": "wechat-trade-assistant-ui",
   "version": "1.0.0",
   "description": "南美外贸微信智能助手桌面端 UI",
-  "main": "electron/main.js",
+  "main": "dist-electron/main.js",
   "author": "WTA",
   "license": "MIT",
   "scripts": {
@@ -33,7 +33,7 @@
     "productName": "WeChat Trade Assistant",
     "files": [
       "dist/**",
-      "electron/**"
+      "dist-electron/**"
     ],
     "extraResources": [
       {
@@ -44,14 +44,12 @@
       {
         "from": "../models",
         "to": "models",
-        "filter": ["**/*"],
-        "optional": true
+        "filter": ["**/*"]
       },
       {
         "from": "../bin",
         "to": "bin",
-        "filter": ["**/*"],
-        "optional": true
+        "filter": ["**/*"]
       }
     ],
     "mac": {
