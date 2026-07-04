@@ -228,17 +228,164 @@ def _is_wechat_resigned() -> bool:
 def _lldb_extract_key(pid: int) -> Optional[str]:
     """用 lldb 附加进程、扫描内存找密钥。
 
-    实际实现参考 wechat-mcp-macos 的 lldb 脚本，较长。
-    此处为接口占位。
-    """
-    # 占位：真实环境应调用 wechat-decrypt.macos.lldb_scan_key(pid)
-    try:
-        from wcd.macos import lldb_scan_key  # type: ignore
+    微信 4.x 在内存中缓存密钥的格式为：
+        x'<64位hex密钥>'<32位hex盐值>'
+    共 100 字节的 ASCII 字符串。
 
-        key = lldb_scan_key(pid)
-        return key.hex() if isinstance(key, bytes) else key
-    except ImportError:
-        return None
+    本函数通过 lldb 读取进程内存区域，搜索该模式。
+    找到候选密钥后，用第一个 .db 文件的首页 HMAC 验证。
+    """
+    import json
+    import tempfile
+
+    # lldb Python 脚本：附加进程、扫描所有可读内存区域、搜索密钥模式
+    lldb_script = r'''
+import re
+import lldb
+
+def scan_memory(debugger, command, result, internal_dict):
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+
+    # 密钥模式：x'<64 hex>'<32 hex>'
+    # 微信 4.x 在内存中以 SQLCipher key 格式缓存
+    key_pattern = re.compile(rb"x'([0-9a-fA-F]{64})'([0-9a-fA-F]{32})'")
+
+    found_keys = set()
+
+    # 遍历所有内存区域
+    info = process.GetMemoryRegions()
+    for i in range(info.GetSize()):
+        region = lldb.SBMemoryRegionInfo()
+        info.GetMemoryRegionAtIndex(i, region)
+
+        # 只扫描可读区域
+        if not region.IsReadable():
+            continue
+        # 跳过非匿名区域（库、堆栈等通常不需要扫描，但为了覆盖也扫描堆）
+        # 不跳过，因为密钥可能在堆中
+
+        start = region.GetRegionBase()
+        end = region.GetRegionEnd()
+        size = end - start
+
+        # 跳过过大区域（>100MB），避免超时
+        if size > 100 * 1024 * 1024:
+            continue
+
+        # 读取内存
+        error = lldb.SBError()
+        data = process.ReadMemory(start, size, error)
+        if error.Fail() or data is None:
+            continue
+
+        # 搜索密钥模式
+        for m in key_pattern.finditer(data):
+            key_hex = m.group(1).decode('ascii')
+            if key_hex not in found_keys:
+                found_keys.add(key_hex)
+
+    # 输出 JSON 数组
+    import json
+    print("WTA_KEYS_JSON:" + json.dumps(list(found_keys)))
+
+scan_memory(lldb.debugger, None, None, None)
+'''
+
+    # 写入临时脚本文件
+    fd, script_path = tempfile.mkstemp(suffix=".py", prefix="wta_lldb_")
+    try:
+        with __import__("os").fdopen(fd, "w") as f:
+            f.write(lldb_script)
+
+        # 执行 lldb
+        result = subprocess.run(
+            ["lldb", "-p", str(pid), "-s", script_path, "-o", "quit"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        # 解析输出，找 WTA_KEYS_JSON: 行
+        keys: list[str] = []
+        for line in result.stdout.splitlines():
+            if line.startswith("WTA_KEYS_JSON:"):
+                try:
+                    keys = json.loads(line[len("WTA_KEYS_JSON:"):])
+                except json.JSONDecodeError:
+                    pass
+                break
+
+        if not keys:
+            return None
+
+        # 验证密钥：尝试用每个候选密钥打开一个已知的 .db 文件
+        return _validate_keys_against_db(keys)
+    finally:
+        try:
+            Path(script_path).unlink()
+        except Exception:
+            pass
+
+
+def _validate_keys_against_db(candidate_keys: list[str]) -> Optional[str]:
+    """用候选密钥列表尝试解密已知的 .db 文件，返回第一个成功的密钥。
+
+    微信 4.x 每个数据库有独立密钥，本函数找到一个能解密任意 .db 的密钥即返回。
+    注意：多密钥场景下，单密钥验证可能不覆盖所有库，但至少能确认密钥提取可用。
+    """
+    from .adapter import find_wechat_data_dirs, find_msg_db, detect_installed_wechat
+    from .parser import is_sqlcipher_available, _find_sqlcipher_binary
+
+    version_info = detect_installed_wechat()
+    if version_info is None:
+        # 默认 4.0
+        from .adapter import WeChatGeneration, WeChatVersionInfo, _detect_platform
+        version_info = WeChatVersionInfo(
+            raw_version="4.0.0.0", major=4, minor=0, patch=0, build=0,
+            generation=WeChatGeneration.GEN_4, platform=_detect_platform(),
+            sqlcipher_compatibility=4,
+        )
+
+    # 找一个 .db 文件来验证
+    data_dirs = find_wechat_data_dirs(version_info)
+    test_db = None
+    for d in data_dirs:
+        test_db = find_msg_db(version_info, d)
+        if test_db:
+            break
+
+    if test_db is None:
+        # 没有 .db 文件可验证，返回第一个候选密钥
+        return candidate_keys[0] if candidate_keys else None
+
+    sqlcipher_bin = _find_sqlcipher_binary()
+    if sqlcipher_bin is None:
+        return candidate_keys[0] if candidate_keys else None
+
+    # 用 sqlcipher CLI 逐个验证
+    for key_hex in candidate_keys:
+        try:
+            sql = (
+                f"PRAGMA key = \"x'{key_hex}'\";\n"
+                f"PRAGMA cipher_compatibility = {version_info.sqlcipher_compatibility};\n"
+                f"SELECT count(*) FROM sqlite_master;\n"
+            )
+            result = subprocess.run(
+                [sqlcipher_bin, str(test_db)],
+                input=sql,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode == 0:
+                return key_hex
+        except Exception:
+            continue
+
+    return None
 
 
 # ----------------------------------------------------------------------------

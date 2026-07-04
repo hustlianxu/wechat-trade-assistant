@@ -374,6 +374,17 @@ def _open_via_sqlcipher_cli(
 
     conn = sqlite3.connect(tmp_path)
     conn.row_factory = sqlite3.Row
-    # 标记临时库路径，关闭时清理
-    conn._wta_tmp_path = tmp_path  # type: ignore[attr-defined]
+    # 用 atexit 注册临时文件清理（sqlite3.Connection 不支持任意属性赋值）
+    import atexit
+    atexit.register(_cleanup_tmp_db, tmp_path)
     return conn
+
+
+def _cleanup_tmp_db(tmp_path: str) -> None:
+    """进程退出时清理 sqlcipher CLI 导出的临时明文库。"""
+    try:
+        p = Path(tmp_path)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass

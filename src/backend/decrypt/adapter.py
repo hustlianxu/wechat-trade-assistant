@@ -182,7 +182,9 @@ def find_wechat_data_dirs(version: WeChatVersionInfo) -> list[Path]:
             lib / "Application Support" / "WeChat",
             # 4) xwechat 命名（与 Windows 一致）
             lib / "Application Support" / "xwechat_files",
-            # 5) 旧 container（3.x 经典版，4.0 可能复用）
+            # 5) 旧 container 内的 Documents/xwechat_files（4.0 Mac 实际路径）
+            lib / "Containers" / "com.tencent.xinWeChat" / "Data" / "Documents" / "xwechat_files",
+            # 6) 旧 container（3.x 经典版，4.0 可能复用）
             lib / "Containers" / "com.tencent.xinWeChat" / "Data" / "Library" /
             "Application Support" / "com.tencent.xinWeChat",
         ]

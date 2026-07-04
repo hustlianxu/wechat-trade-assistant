@@ -883,8 +883,9 @@ def _decrypt_with_multi_keys(
             )
         return "数据库文件未找到。" + " | ".join(parts)
 
-    # 先解密联系人库
-    contact_db_keys = {k: v for k, v in multi_keys.items() if "contact" in k.lower()}
+    # 先解密联系人库（跳过 FTS 索引库，它们常有独立密钥且非业务必需）
+    contact_db_keys = {k: v for k, v in multi_keys.items()
+                       if "contact" in k.lower() and "fts" not in k.lower()}
     for rel_path, key_entry in contact_db_keys.items():
         db_path = _find_db_anywhere(rel_path)
         if db_path is None or not db_path.exists():
@@ -908,11 +909,14 @@ def _decrypt_with_multi_keys(
             finally:
                 conn.close()
         except Exception as e:  # noqa: BLE001
+            err_msg = str(e)
+            if "file is not a database" in err_msg or "not a database" in err_msg:
+                err_msg = f"密钥不匹配或数据库损坏（sqlcipher 报 file is not a database）。该库的 enc_key 可能不正确。原始错误：{err_msg}"
             db_results.append(schemas.DecryptDbResult(
-                db_path=str(db_path), ok=False, message=f"解密失败：{e}"
+                db_path=str(db_path), ok=False, message=f"解密失败：{err_msg}"
             ))
 
-    # 再解密消息库（所有 message_*.db）
+    # 再解密消息库（所有 message_*.db，跳过 FTS 和 biz 索引库）
     msg_db_keys = {k: v for k, v in multi_keys.items() if "message" in k.lower() and "fts" not in k.lower() and "biz" not in k.lower()}
     for rel_path, key_entry in msg_db_keys.items():
         db_path = _find_db_anywhere(rel_path)
@@ -948,8 +952,11 @@ def _decrypt_with_multi_keys(
             finally:
                 conn.close()
         except Exception as e:  # noqa: BLE001
+            err_msg = str(e)
+            if "file is not a database" in err_msg or "not a database" in err_msg:
+                err_msg = f"密钥不匹配或数据库损坏。原始错误：{err_msg}"
             db_results.append(schemas.DecryptDbResult(
-                db_path=str(db_path), ok=False, message=f"解密失败：{e}"
+                db_path=str(db_path), ok=False, message=f"解密失败：{err_msg}"
             ))
 
     finished_ts = int(time.time())
