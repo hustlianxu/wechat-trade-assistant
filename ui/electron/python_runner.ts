@@ -91,10 +91,29 @@ function resolvePythonEnv(): { command: string; args: string[]; cwd: string; env
 
 // 启动 Python 后端子进程，解析 stdout 中的 READY:<port> 行
 // 超时 30 秒未就绪则 reject
-export function startPythonBackend(): Promise<number> {
+// preferredPort: 期望端口（通过 WTA_PORT 环境变量传给后端）
+export function startPythonBackend(preferredPort?: number): Promise<number> {
   return new Promise((resolve, reject) => {
     const { command, args, cwd, env } = resolvePythonEnv();
-    console.log(`[python] 启动: ${command} ${args.join(' ')} (cwd=${cwd}, production=${isProduction()})`);
+
+    // 通过 WTA_PORT 指定后端监听端口（后端 main.py 读取此环境变量）
+    if (preferredPort && !env.WTA_PORT) {
+      env.WTA_PORT = String(preferredPort);
+    }
+
+    // macOS/Linux: 打包后的 PyInstaller 可执行文件在 electron-builder 打包后
+    // 可能丢失执行权限位，spawn 时会报 EACCES。spawn 前补上执行权限。
+    if (process.platform !== 'win32') {
+      try {
+        if (fs.existsSync(command)) {
+          fs.chmodSync(command, 0o755);
+        }
+      } catch (e) {
+        console.warn(`[python] chmod ${command} 失败:`, e);
+      }
+    }
+
+    console.log(`[python] 启动: ${command} ${args.join(' ')} (cwd=${cwd}, production=${isProduction()}, port=${preferredPort || 'default'})`);
 
     let childProc: ChildProcess;
     try {
