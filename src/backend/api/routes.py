@@ -20,6 +20,7 @@ from ..decrypt import (
     extract_key,
     find_all_dbs,
     find_all_msg_dbs,
+    find_db_for_key,
     find_micro_msg_db,
     find_msg_db,
     find_wechat_data_dirs,
@@ -814,7 +815,7 @@ def _decrypt_with_multi_keys(
     # 先解密联系人库
     contact_db_keys = {k: v for k, v in multi_keys.items() if "contact" in k.lower()}
     for rel_path, key_entry in contact_db_keys.items():
-        db_path = all_dbs.get(rel_path)
+        db_path = find_db_for_key(all_dbs, rel_path)
         if db_path is None or not db_path.exists():
             db_results.append(schemas.DecryptDbResult(
                 db_path=rel_path, ok=False, message="数据库文件未找到"
@@ -843,7 +844,7 @@ def _decrypt_with_multi_keys(
     # 再解密消息库（所有 message_*.db）
     msg_db_keys = {k: v for k, v in multi_keys.items() if "message" in k.lower() and "fts" not in k.lower() and "biz" not in k.lower()}
     for rel_path, key_entry in msg_db_keys.items():
-        db_path = all_dbs.get(rel_path)
+        db_path = find_db_for_key(all_dbs, rel_path)
         if db_path is None or not db_path.exists():
             db_results.append(schemas.DecryptDbResult(
                 db_path=rel_path, ok=False, message="数据库文件未找到"

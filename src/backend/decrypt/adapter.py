@@ -184,9 +184,14 @@ def find_wechat_data_dirs(version: WeChatVersionInfo) -> list[Path]:
                 if sub.is_dir():
                     candidates.append(sub.parent)
             # 4.0 的 message/message_0.db 结构也在这个 container 下
+            # message_*.db 的父目录是 message/，再上一级才是账号根目录
+            seen_4x_dirs: set[str] = set()
             for sub in base_3x.rglob("message_*.db"):
-                candidates.append(sub.parent.parent)
-                break
+                account_dir = sub.parent.parent
+                key = str(account_dir)
+                if key not in seen_4x_dirs:
+                    seen_4x_dirs.add(key)
+                    candidates.append(account_dir)
             candidates.append(base_3x)
         # 4.0 在 Mac 上的非沙盒路径
         base_4x = home / "Library" / "Application Support" / "com.tencent.xWeChat"
@@ -198,9 +203,13 @@ def find_wechat_data_dirs(version: WeChatVersionInfo) -> list[Path]:
         # 4.0 另一种 container 路径
         base_4x_alt = home / "Library" / "Containers" / "com.tencent.WeChat"
         if base_4x_alt.exists():
+            seen_alt: set[str] = set()
             for sub in base_4x_alt.rglob("message_*.db"):
-                candidates.append(sub.parent.parent)
-                break
+                account_dir = sub.parent.parent
+                key = str(account_dir)
+                if key not in seen_alt:
+                    seen_alt.add(key)
+                    candidates.append(account_dir)
             candidates.append(base_4x_alt)
         # 4.0 xwechat 命名（与 Windows 一致）
         base_xwechat = home / "Library" / "Application Support" / "xwechat_files"
@@ -288,6 +297,8 @@ def find_all_dbs(version: WeChatVersionInfo, data_dir: Path) -> dict[str, Path]:
 
     用于多密钥解密：用户的 JSON key 以相对路径为 key，
     本函数产出的相对路径与之对应。
+
+    注意：同时返回原始大小写键，调用方可通过 find_db_for_key 做大小写不敏感匹配。
     """
     result: dict[str, Path] = {}
     if not data_dir.exists():
@@ -296,6 +307,27 @@ def find_all_dbs(version: WeChatVersionInfo, data_dir: Path) -> dict[str, Path]:
         rel = str(p.relative_to(data_dir)).replace("\\", "/")
         result[rel] = p
     return result
+
+
+def find_db_for_key(all_dbs: dict[str, Path], db_rel_path: str) -> Optional[Path]:
+    """根据 JSON 中的相对路径查找实际数据库文件，大小写不敏感。
+
+    微信 4.0.x 在不同平台/版本下路径大小写可能不同（如 Message/Message_0.db
+    vs message/message_0.db），而 SQLCipher 密钥与路径内容无关，因此做大小写
+    不敏感匹配以提高兼容性。
+    """
+    if not db_rel_path:
+        return None
+    normalized = db_rel_path.replace("\\", "/").lstrip("./")
+    # 精确匹配
+    if normalized in all_dbs:
+        return all_dbs[normalized]
+    # 大小写不敏感匹配
+    lower = normalized.lower()
+    for rel, abs_path in all_dbs.items():
+        if rel.lower() == lower:
+            return abs_path
+    return None
 
 
 def find_micro_msg_db(version: WeChatVersionInfo, data_dir: Path) -> Optional[Path]:
@@ -331,17 +363,34 @@ def detect_installed_wechat() -> Optional[WeChatVersionInfo]:
     raw: Optional[str] = None
 
     if plat == Platform.WINDOWS:
-        # Windows: 读注册表 HKLM\SOFTWARE\Tencent\WeChat
+        # Windows: 读注册表
+        # 4.0 用 xwechat 项，3.x 用 WeChat 项
         try:
             import winreg  # type: ignore
 
-            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            # 候选注册表路径：4.0 优先
+            reg_paths = [
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Tencent\xwechat"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tencent\xwechat"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Tencent\WeChat"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tencent\WeChat"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\WOW6432Node\Tencent\WeChat"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Tencent\WeChat"),
+            ]
+            for hive, subkey in reg_paths:
                 try:
-                    with winreg.OpenKey(
-                        hive, r"SOFTWARE\Tencent\WeChat", 0, winreg.KEY_READ
-                    ) as key:
-                        raw, _ = winreg.QueryValueEx(key, "Version")
-                        break
+                    with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ) as key:
+                        # 版本值名可能是 Version / version / ClientVersion
+                        for val_name in ("Version", "version", "ClientVersion"):
+                            try:
+                                raw, _ = winreg.QueryValueEx(key, val_name)
+                                if raw:
+                                    raw = str(raw)
+                                    break
+                            except OSError:
+                                continue
+                        if raw:
+                            break
                 except OSError:
                     continue
         except ImportError:
