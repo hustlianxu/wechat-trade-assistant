@@ -8,15 +8,21 @@ let mainWindow: BrowserWindow | null = null;
 // 后端服务端口，由 python_runner 解析 READY 行得到，默认 8765
 let backendPort: number = 8765;
 
+// 后端启动错误信息（供前端查询）
+let backendError: string | null = null;
+
 // 应用启动入口：先启动 Python 后端，再创建窗口
 async function bootstrap(): Promise<void> {
   try {
     // 等待后端就绪并解析端口
     backendPort = await startPythonBackend();
     console.log(`[main] Python 后端就绪，端口=${backendPort}`);
+    backendError = null;
   } catch (err) {
-    // 后端启动失败时打印错误，仍尝试用默认端口加载前端以便调试
-    console.error('[main] Python 后端启动失败:', err);
+    // 后端启动失败时记录错误，仍尝试用默认端口加载前端以便调试
+    const msg = err instanceof Error ? err.message : String(err);
+    backendError = msg;
+    console.error('[main] Python 后端启动失败:', msg);
   }
   createWindow();
 }
@@ -35,7 +41,10 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       // 通过附加参数把后端端口传给 preload
-      additionalArguments: [`--backend-port=${backendPort}`],
+      additionalArguments: [
+        `--backend-port=${backendPort}`,
+        `--backend-error=${backendError ? encodeURIComponent(backendError) : ''}`,
+      ],
     },
   });
 

@@ -143,18 +143,33 @@ def find_wechat_data_dirs(version: WeChatVersionInfo) -> list[Path]:
 
     if plat == Platform.WINDOWS:
         if version.generation == WeChatGeneration.GEN_4:
-            # 4.0: %APPDATA%\Tencent\xwechat_files\
-            appdata = Path.home() / "AppData" / "Roaming"
-            candidates.append(appdata / "Tencent" / "xwechat_files")
-            # 也可能放 Local
-            candidates.append(Path.home() / "AppData" / "Local" / "Tencent" / "xwechat_files")
+            # 4.0: %APPDATA%\Tencent\xwechat_files\<wxid>\
+            # 每个登录账号一个子目录，内含 message/ contact/ session/ 等
+            appdata_roaming = Path.home() / "AppData" / "Roaming"
+            appdata_local = Path.home() / "AppData" / "Local"
+            for base in (
+                appdata_roaming / "Tencent" / "xwechat_files",
+                appdata_local / "Tencent" / "xwechat_files",
+            ):
+                if base.exists():
+                    # xwechat_files 下每个子目录是一个账号
+                    for sub in base.iterdir():
+                        if sub.is_dir() and (sub / "message").exists():
+                            candidates.append(sub)
+                    # 也保留父目录，调用方可自行下钻
+                    candidates.append(base)
         elif version.generation == WeChatGeneration.GEN_3:
             docs = Path.home() / "Documents" / "WeChat Files"
-            candidates.append(docs)
+            if docs.exists():
+                for sub in docs.iterdir():
+                    if sub.is_dir() and (sub / "Msg").exists():
+                        candidates.append(sub)
+                candidates.append(docs)
     elif plat == Platform.MACOS:
-        # macOS 沙盒路径
-        base = (
-            Path.home()
+        home = Path.home()
+        # macOS 沙盒路径（3.x 经典版 / 4.0 共用同一 container）
+        base_3x = (
+            home
             / "Library"
             / "Containers"
             / "com.tencent.xinWeChat"
@@ -163,24 +178,56 @@ def find_wechat_data_dirs(version: WeChatVersionInfo) -> list[Path]:
             / "Application Support"
             / "com.tencent.xinWeChat"
         )
-        candidates.append(base)
-        # 4.0 在 Mac 上路径可能变化
-        candidates.append(
-            Path.home() / "Library" / "Application Support" / "com.tencent.xWeChat"
-        )
+        if base_3x.exists():
+            # 2.0b4.0.9 这种子目录结构（3.x）
+            for sub in base_3x.rglob("message"):
+                if sub.is_dir():
+                    candidates.append(sub.parent)
+            # 4.0 的 message/message_0.db 结构也在这个 container 下
+            for sub in base_3x.rglob("message_*.db"):
+                candidates.append(sub.parent.parent)
+                break
+            candidates.append(base_3x)
+        # 4.0 在 Mac 上的非沙盒路径
+        base_4x = home / "Library" / "Application Support" / "com.tencent.xWeChat"
+        if base_4x.exists():
+            for sub in base_4x.iterdir():
+                if sub.is_dir() and (sub / "message").exists():
+                    candidates.append(sub)
+            candidates.append(base_4x)
+        # 4.0 另一种 container 路径
+        base_4x_alt = home / "Library" / "Containers" / "com.tencent.WeChat"
+        if base_4x_alt.exists():
+            for sub in base_4x_alt.rglob("message_*.db"):
+                candidates.append(sub.parent.parent)
+                break
+            candidates.append(base_4x_alt)
+        # 4.0 xwechat 命名（与 Windows 一致）
+        base_xwechat = home / "Library" / "Application Support" / "xwechat_files"
+        if base_xwechat.exists():
+            for sub in base_xwechat.iterdir():
+                if sub.is_dir() and (sub / "message").exists():
+                    candidates.append(sub)
+            candidates.append(base_xwechat)
     elif plat == Platform.LINUX:
-        # Linux 微信（较新， Electron 化）
         candidates.append(Path.home() / ".config" / "WeChat")
 
-    # 过滤存在的
-    return [p for p in candidates if p.exists()]
+    # 去重并过滤存在的
+    seen = set()
+    result = []
+    for p in candidates:
+        key = str(p.resolve())
+        if key not in seen and p.exists():
+            seen.add(key)
+            result.append(p)
+    return result
 
 
 def find_msg_db(version: WeChatVersionInfo, data_dir: Path) -> Optional[Path]:
     """在用户数据目录下找消息数据库主文件。
 
     微信 3.x: Msg/Multi/MSG0.db ~ MSGn.db + Misc.db
-    微信 4.0: message_*.db（xwechat 的新命名）
+    微信 4.0: message/message_0.db ~ message_n.db
     """
     if version.generation == WeChatGeneration.GEN_3:
         msg_dir = data_dir / "Msg" / "Multi"
@@ -193,12 +240,62 @@ def find_msg_db(version: WeChatVersionInfo, data_dir: Path) -> Optional[Path]:
         if misc.exists():
             return misc
     elif version.generation == WeChatGeneration.GEN_4:
-        # 4.0 的 db 命名
+        # 4.0 数据目录结构：data_dir/message/message_0.db ~ message_n.db
+        msg_dir = data_dir / "message"
+        if msg_dir.exists():
+            matches = sorted(msg_dir.glob("message_*.db"))
+            if matches:
+                return matches[0]
+        # 兼容直接在 data_dir 下的情况
+        for pattern in ("message_*.db", "MSG*.db"):
+            matches = sorted(data_dir.glob(pattern))
+            if matches:
+                return matches[0]
+        # 兜底递归搜索
         for pattern in ("message_*.db", "MSG*.db"):
             matches = sorted(data_dir.rglob(pattern))
             if matches:
                 return matches[0]
     return None
+
+
+def find_all_msg_dbs(version: WeChatVersionInfo, data_dir: Path) -> list[Path]:
+    """找出所有消息数据库（4.0 有多个 message_N.db）。"""
+    result: list[Path] = []
+    if version.generation == WeChatGeneration.GEN_4:
+        msg_dir = data_dir / "message"
+        if msg_dir.exists():
+            result.extend(sorted(msg_dir.glob("message_*.db")))
+        if not result:
+            result.extend(sorted(data_dir.rglob("message_*.db")))
+    elif version.generation == WeChatGeneration.GEN_3:
+        msg_dir = data_dir / "Msg" / "Multi"
+        if msg_dir.exists():
+            result.extend(sorted(msg_dir.glob("MSG*.db")))
+    # 去重
+    seen = set()
+    unique = []
+    for p in result:
+        k = str(p)
+        if k not in seen:
+            seen.add(k)
+            unique.append(p)
+    return unique
+
+
+def find_all_dbs(version: WeChatVersionInfo, data_dir: Path) -> dict[str, Path]:
+    """找出数据目录下所有 .db 文件，返回 相对路径 → 绝对路径 映射。
+
+    用于多密钥解密：用户的 JSON key 以相对路径为 key，
+    本函数产出的相对路径与之对应。
+    """
+    result: dict[str, Path] = {}
+    if not data_dir.exists():
+        return result
+    for p in data_dir.rglob("*.db"):
+        rel = str(p.relative_to(data_dir)).replace("\\", "/")
+        result[rel] = p
+    return result
 
 
 def find_micro_msg_db(version: WeChatVersionInfo, data_dir: Path) -> Optional[Path]:
@@ -207,7 +304,14 @@ def find_micro_msg_db(version: WeChatVersionInfo, data_dir: Path) -> Optional[Pa
         p = data_dir / "Msg" / "MicroMsg.db"
         return p if p.exists() else None
     elif version.generation == WeChatGeneration.GEN_4:
-        for pattern in ("contact_*.db", "MicroMsg.db"):
+        # 4.0: contact/contact.db
+        contact_dir = data_dir / "contact"
+        if contact_dir.exists():
+            p = contact_dir / "contact.db"
+            if p.exists():
+                return p
+        # 兼容兜底
+        for pattern in ("contact.db", "contact_*.db", "MicroMsg.db"):
             matches = sorted(data_dir.rglob(pattern))
             if matches:
                 return matches[0]
@@ -250,15 +354,21 @@ def detect_installed_wechat() -> Optional[WeChatVersionInfo]:
             for app_path in (
                 Path("/Applications/WeChat.app/Contents/Info.plist"),
                 Path("/Applications/微信.app/Contents/Info.plist"),
+                Path("/Applications/WeChat-beta.app/Contents/Info.plist"),
             ):
                 if app_path.exists():
                     with app_path.open("rb") as f:
                         plist = plistlib.load(f)
                     raw = str(plist.get("CFBundleShortVersionString", ""))
+                    if not raw:
+                        # 某些版本用 CFBundleVersion
+                        raw = str(plist.get("CFBundleVersion", ""))
                     if raw:
-                        # macOS 版本号通常只有 3 段，补 build 为 0
-                        if raw.count(".") == 2:
-                            raw = raw + ".0"
+                        # macOS 版本号可能只有 2~3 段，补齐到 4 段
+                        parts = raw.split(".")
+                        while len(parts) < 4:
+                            parts.append("0")
+                        raw = ".".join(parts[:4])
                         break
         except Exception:  # noqa: BLE001
             pass

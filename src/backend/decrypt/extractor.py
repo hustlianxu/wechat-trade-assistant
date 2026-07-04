@@ -14,16 +14,23 @@ macOS 因 SIP + Hardened Runtime，需要先对 WeChat.app 做 ad-hoc 重签名�
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.wintypes
 import platform
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from .adapter import Platform, WeChatGeneration, WeChatVersionInfo, _detect_platform
+
+# ctypes.wintypes 仅 Windows 可用，且非必需（仅 _native_scan_memory_windows 用到）。
+# 在非 Windows 平台做条件导入，避免在某些精简 Python 环境触发 ImportError。
+try:
+    import ctypes  # noqa: F401
+    if platform.system().lower() == "windows":
+        import ctypes.wintypes  # noqa: F401
+except ImportError:
+    pass
 
 
 @dataclass
@@ -289,6 +296,73 @@ def make_manual_key(key_hex: str) -> ExtractedKey:
     if not validate_manual_key(cleaned):
         raise KeyExtractionError("密钥格式错误，应为 64 位 hex 字符串")
     return ExtractedKey(key_hex=cleaned, source="manual")
+
+
+# ----------------------------------------------------------------------------
+# 多数据库密钥（微信 4.0.x）
+# ----------------------------------------------------------------------------
+@dataclass
+class MultiKeyEntry:
+    """单个数据库的密钥条目。
+
+    微信 4.0.x 对每个 .db 文件使用独立的 SQLCipher 密钥，
+    因此需要按 db 相对路径映射到各自的 enc_key。
+    """
+
+    db_rel_path: str  # 相对数据目录的路径，如 "message/message_0.db"
+    key_hex: str      # 64 位 hex 密钥
+
+    @property
+    def key_bytes(self) -> bytes:
+        return bytes.fromhex(self.key_hex)
+
+
+def parse_multi_keys_json(raw: str) -> Dict[str, MultiKeyEntry]:
+    """解析用户提供的多密钥 JSON。
+
+    输入格式（来自 PyWxDump / wechat-decrypt 等工具导出）：
+        {
+          "message/message_0.db": {"enc_key": "4fb2f098..."},
+          "contact/contact.db": {"enc_key": "64989d4f..."},
+          ...
+        }
+
+    Returns:
+        dict[db_rel_path -> MultiKeyEntry]
+    """
+    import json
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise KeyExtractionError(f"多密钥 JSON 格式错误：{e}") from e
+
+    if not isinstance(data, dict):
+        raise KeyExtractionError("多密钥 JSON 顶层应为对象")
+
+    result: Dict[str, MultiKeyEntry] = {}
+    for db_path, entry in data.items():
+        if not isinstance(entry, dict):
+            raise KeyExtractionError(f"密钥条目 {db_path} 不是对象")
+        key_hex = entry.get("enc_key") or entry.get("key") or entry.get("key_hex")
+        if not key_hex:
+            raise KeyExtractionError(f"密钥条目 {db_path} 缺少 enc_key 字段")
+        cleaned = str(key_hex).strip().replace("-", "").replace(" ", "").lower()
+        if not HEX_PATTERN.match(cleaned):
+            raise KeyExtractionError(f"密钥 {db_path} 格式错误，应为 64 位 hex")
+        # 统一路径分隔符为正斜杠
+        normalized = db_path.replace("\\", "/").lstrip("./")
+        result[normalized] = MultiKeyEntry(db_rel_path=normalized, key_hex=cleaned)
+    return result
+
+
+def validate_multi_keys_json(raw: str) -> bool:
+    """校验多密钥 JSON 格式是否合法。"""
+    try:
+        parse_multi_keys_json(raw)
+        return True
+    except KeyExtractionError:
+        return False
 
 
 # ----------------------------------------------------------------------------

@@ -134,6 +134,7 @@ export interface SettingsResponse {
   llm_api_key_set: boolean;
   whisper_available: boolean;
   intent_model_available: boolean;
+  sqlcipher_available: boolean;
   db_path: string;
   data_dir: string;
 }
@@ -149,6 +150,9 @@ export interface RealtimeListenRequest {
 export interface ManualKeyRequest {
   key_hex: string;
 }
+export interface ManualKeysJsonRequest {
+  keys_json: string;
+}
 export interface ResignRequest {
   password?: string | null;
 }
@@ -162,21 +166,32 @@ export interface DecryptStatusResponse {
   data_dirs: string[];
   last_decrypt_run: Record<string, any> | null;
 }
+export interface DecryptDbResult {
+  db_path: string;
+  ok: boolean;
+  message: string;
+  msg_count: number;
+  contact_count: number;
+}
 export interface DecryptTriggerRequest {
   source: string;
   manual_key?: string | null;
+  manual_keys_json?: string | null;
   wxid?: string | null;
+  data_dir?: string | null;
 }
 export interface DecryptTriggerResponse {
   ok: boolean;
   message: string;
   msg_count: number;
   contact_count: number;
+  db_results: DecryptDbResult[];
 }
 
 // 渲染进程通过 preload 暴露的全局 API 类型
 export interface WindowApi {
   apiUrl: string;
+  backendError: string;
   openExternal: (url: string) => void;
 }
 

@@ -19,6 +19,7 @@ import type {
   LLMConfigRequest,
   RealtimeListenRequest,
   ManualKeyRequest,
+  ManualKeysJsonRequest,
   ResignRequest,
   DecryptStatusResponse,
   DecryptTriggerRequest,
@@ -152,6 +153,22 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+  setManualKeysJson: (body: ManualKeysJsonRequest) =>
+    request<OkResponse>('/api/settings/manual-keys-json', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  getManualKeysJson: () =>
+    request<{ keys_json: string; has_keys: boolean }>('/api/settings/manual-keys-json'),
+
+  // ===== 数据目录（手动指定） =====
+  setDataDir: (data_dir: string) =>
+    request<OkResponse>('/api/settings/data-dir', {
+      method: 'POST',
+      body: JSON.stringify({ data_dir }),
+    }),
+  getDataDir: () =>
+    request<{ data_dir: string; has_dir: boolean }>('/api/settings/data-dir'),
 
   // ===== 解密 =====
   getDecryptStatus: () => request<DecryptStatusResponse>('/api/decrypt/status'),

@@ -198,6 +198,7 @@ class SettingsResponse(BaseModel):
     llm_api_key_set: bool = False
     whisper_available: bool = False
     intent_model_available: bool = False
+    sqlcipher_available: bool = False
     db_path: str = ""
     data_dir: str = ""
 
@@ -215,6 +216,20 @@ class RealtimeListenRequest(BaseModel):
 
 class ManualKeyRequest(BaseModel):
     key_hex: str
+
+
+class ManualKeysJsonRequest(BaseModel):
+    """微信 4.0.x 多数据库密钥 JSON。
+
+    格式示例：
+        {
+          "message/message_0.db": {"enc_key": "4fb2..."},
+          "contact/contact.db": {"enc_key": "6498..."},
+          ...
+        }
+    """
+
+    keys_json: str
 
 
 class ResignRequest(BaseModel):
@@ -237,9 +252,21 @@ class DecryptStatusResponse(BaseModel):
 class DecryptTriggerRequest(BaseModel):
     """手动触发解密导入。"""
 
-    source: str = "auto"  # auto / memory / registry / manual
-    manual_key: Optional[str] = None
+    source: str = "auto"  # auto / memory / registry / manual / multi_keys
+    manual_key: Optional[str] = None  # 单密钥（3.x / 单个 db）
+    manual_keys_json: Optional[str] = None  # 多密钥 JSON（4.0.x 多 db）
     wxid: Optional[str] = None  # 多账号时指定
+    data_dir: Optional[str] = None  # 手动指定微信数据目录（自动检测失败时用）
+
+
+class DecryptDbResult(BaseModel):
+    """单个数据库的解密结果。"""
+
+    db_path: str
+    ok: bool
+    message: str = ""
+    msg_count: int = 0
+    contact_count: int = 0
 
 
 class DecryptTriggerResponse(BaseModel):
@@ -247,3 +274,4 @@ class DecryptTriggerResponse(BaseModel):
     message: str
     msg_count: int = 0
     contact_count: int = 0
+    db_results: List[DecryptDbResult] = Field(default_factory=list)

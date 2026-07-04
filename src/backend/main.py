@@ -109,24 +109,47 @@ def _maybe_start_realtime_listener() -> None:
         return
 
     try:
-        from .decrypt import PollingListener, SSEConfig, detect_installed_wechat
+        from .decrypt import (
+            SSEConfig,
+            PollingListener,
+            detect_installed_wechat,
+            extract_key,
+            find_msg_db,
+            find_wechat_data_dirs,
+        )
 
         version_info = detect_installed_wechat()
         if version_info is None:
             logger.info("未检测到微信，跳过实时监听")
             return
 
-        # SSEConfig 默认值，可后续做更精细配置
-        cfg = SSEConfig(interval_seconds=15)
+        data_dirs = find_wechat_data_dirs(version_info)
+        if not data_dirs:
+            logger.info("未找到微信数据目录，跳过实时监听")
+            return
+        msg_db = find_msg_db(version_info, data_dirs[0])
+        if msg_db is None:
+            logger.info("未找到消息库，跳过实时监听")
+            return
+
+        try:
+            key = extract_key(version_info, source="auto")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("实时监听密钥提取失败：%s", e)
+            return
+
+        cfg = SSEConfig(poll_interval_sec=15)
         listener = PollingListener(
-            version_info=version_info,
-            config=cfg,
+            db_path=msg_db,
+            key=key.key_bytes,
+            version=version_info,
             on_new_messages=_on_new_messages_callback,
+            config=cfg,
         )
         listener.start()
         with _realtime_lock:
             _realtime_listener = listener
-        logger.info("实时监听器已启动，间隔 %ss", cfg.interval_seconds)
+        logger.info("实时监听器已启动，间隔 %ss", cfg.poll_interval_sec)
     except Exception as e:  # noqa: BLE001
         logger.warning("实时监听器初始化失败：%s", e)
 

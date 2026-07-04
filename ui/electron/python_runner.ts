@@ -1,4 +1,5 @@
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, ChildProcess, execFileSync } from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 import { app } from 'electron';
 
@@ -8,6 +9,37 @@ let child: ChildProcess | null = null;
 // 判断是否为打包后的生产环境
 function isProduction(): boolean {
   return app.isPackaged;
+}
+
+// 在系统中查找可用的 Python 可执行文件（dev 模式用）
+function findPythonBinary(): string | null {
+  const candidates: string[] = [];
+  if (process.platform === 'win32') {
+    candidates.push('python', 'python3', 'py');
+    // 常见安装路径
+    candidates.push('C:\\Python311\\python.exe', 'C:\\Python310\\python.exe', 'C:\\Python39\\python.exe');
+    candidates.push(
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python311', 'python.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python310', 'python.exe'),
+    );
+  } else {
+    candidates.push('python3', 'python');
+    // macOS 常见路径（Homebrew / pyenv / 系统自带）
+    candidates.push('/usr/local/bin/python3', '/opt/homebrew/bin/python3', '/usr/bin/python3');
+    candidates.push('/opt/homebrew/bin/python3.11', '/opt/homebrew/bin/python3.10');
+    candidates.push(path.join(process.env.HOME || '', '.pyenv', 'shims', 'python3'));
+  }
+  for (const cmd of candidates) {
+    try {
+      // 如果是绝对路径且文件不存在，跳过
+      if (path.isAbsolute(cmd) && !fs.existsSync(cmd)) continue;
+      execFileSync(cmd, ['--version'], { stdio: 'pipe', timeout: 3000 });
+      return cmd;
+    } catch {
+      // 继续尝试下一个
+    }
+  }
+  return null;
 }
 
 // 解析后端启动命令
@@ -46,10 +78,11 @@ function resolvePythonEnv(): { command: string; args: string[]; cwd: string; env
     return { command, args, cwd: runtimeDir, env };
   }
 
-  // 开发态
+  // 开发态：从 src/ 目录运行 backend.main
   const cwd = path.resolve(__dirname, '..', '..', 'src');
+  const pythonBin = findPythonBinary() || (process.platform === 'win32' ? 'python' : 'python3');
   return {
-    command: process.platform === 'win32' ? 'python' : 'python3',
+    command: pythonBin,
     args: ['-m', 'backend.main'],
     cwd,
     env: { ...process.env, PYTHONUNBUFFERED: '1' },
@@ -63,9 +96,17 @@ export function startPythonBackend(): Promise<number> {
     const { command, args, cwd, env } = resolvePythonEnv();
     console.log(`[python] 启动: ${command} ${args.join(' ')} (cwd=${cwd}, production=${isProduction()})`);
 
-    child = spawn(command, args, { cwd, env });
+    let childProc: ChildProcess;
+    try {
+      childProc = spawn(command, args, { cwd, env });
+    } catch (err) {
+      reject(new Error(`无法 spawn Python 进程: ${err}`));
+      return;
+    }
+    child = childProc;
 
     let resolved = false;
+    const stderrBuffer: string[] = [];
 
     // 30 秒超时保护
     const timer = setTimeout(() => {
@@ -77,7 +118,7 @@ export function startPythonBackend(): Promise<number> {
     }, 30000);
 
     // 监听 stdout，逐行查找匹配 /^READY:(\d+)$/ 的行
-    child.stdout?.on('data', (data: Buffer) => {
+    childProc.stdout?.on('data', (data: Buffer) => {
       const text = data.toString();
       process.stdout.write(`[python] ${text}`);
       text.split(/\r?\n/).forEach((line) => {
@@ -91,22 +132,25 @@ export function startPythonBackend(): Promise<number> {
     });
 
     // 打印 stderr 便于排错
-    child.stderr?.on('data', (data: Buffer) => {
-      process.stderr.write(`[python:err] ${data.toString()}`);
+    childProc.stderr?.on('data', (data: Buffer) => {
+      const text = data.toString();
+      process.stderr.write(`[python:err] ${text}`);
+      stderrBuffer.push(text);
     });
 
     // 子进程异常退出时若尚未就绪则 reject
-    child.on('exit', (code) => {
+    childProc.on('exit', (code) => {
       console.log(`[python] 子进程退出，code=${code}`);
       child = null;
       if (!resolved) {
         resolved = true;
         clearTimeout(timer);
-        reject(new Error(`Python 后端进程意外退出，code=${code}`));
+        const errTail = stderrBuffer.slice(-10).join('');
+        reject(new Error(`Python 后端进程意外退出，code=${code}\n${errTail}`));
       }
     });
 
-    child.on('error', (err) => {
+    childProc.on('error', (err) => {
       if (!resolved) {
         resolved = true;
         clearTimeout(timer);

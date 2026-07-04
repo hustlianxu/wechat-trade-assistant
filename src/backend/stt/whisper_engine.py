@@ -7,22 +7,45 @@
 1. 优先调用打包的 whisper.cpp 可执行文件（main 或 whisper-cli）
 2. 失败时尝试 Python whisper 包
 3. 都不可用时返回占位文本（开发环境），生产环境应报错
+
+路径解析优先级：
+1. 环境变量 WTA_BIN_DIR / WTA_MODELS_DIR（由 Electron 主进程注入）
+2. 打包后 extraResources 中的 bin/ / models/
+3. 开发态项目根下的 bin/ / models/
 """
 
 from __future__ import annotations
 
 import json
+import os
 import platform
 import subprocess
 from pathlib import Path
 from typing import List, Optional
 
 
+def _resolve_bin_dir() -> Path:
+    """解析原生二进制目录。"""
+    env = os.environ.get("WTA_BIN_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    # 复用 config 模块的路径逻辑，保持一致
+    from ..config import get_bin_dir
+    return get_bin_dir()
+
+
+def _resolve_models_dir() -> Path:
+    """解析模型目录。"""
+    env = os.environ.get("WTA_MODELS_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    from ..config import get_models_dir
+    return get_models_dir()
+
+
 def _bundled_whisper_path() -> Path:
     """返回随应用打包的 whisper.cpp 可执行文件路径。"""
-    here = Path(__file__).resolve().parent
-    project_root = here.parents[3]
-    bin_dir = project_root / "bin"
+    bin_dir = _resolve_bin_dir()
     system = platform.system().lower()
     if system == "windows":
         return bin_dir / "windows" / "whisper-cli.exe"
@@ -34,9 +57,7 @@ def _bundled_whisper_path() -> Path:
 
 def _default_model_path() -> Path:
     """默认 whisper 模型路径。"""
-    here = Path(__file__).resolve().parent
-    project_root = here.parents[3]
-    return project_root / "models" / "whisper" / "ggml-small.bin"
+    return _resolve_models_dir() / "whisper" / "ggml-small.bin"
 
 
 class WhisperEngine:

@@ -14,13 +14,21 @@ export default function Settings() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState('');
+  // 后端不可达错误（loadAll 失败时设置）
+  const [loadError, setLoadError] = useState('');
 
   // LLM 表单
   const [llmBase, setLlmBase] = useState('');
   const [llmKey, setLlmKey] = useState('');
   const [llmModel, setLlmModel] = useState('');
-  // 手动密钥
+  // 手动密钥（单 key，3.x）
   const [manualKey, setManualKey] = useState('');
+  // 多密钥 JSON（4.0.x）
+  const [multiKeysJson, setMultiKeysJson] = useState('');
+  const [multiKeysSaved, setMultiKeysSaved] = useState(false);
+  // 手动数据目录
+  const [dataDir, setDataDir] = useState('');
+  const [dataDirSaved, setDataDirSaved] = useState(false);
   // 实时解析开关
   const [realtime, setRealtime] = useState(false);
   // 重签名密码（macOS）
@@ -28,23 +36,44 @@ export default function Settings() {
   // 解密结果
   const [decryptResult, setDecryptResult] = useState<DecryptTriggerResponse | null>(null);
 
+  // 后端启动错误（由 preload 从 Electron 主进程传入）
+  const backendError = (window.api?.backendError as string) || '';
+
   const showToast = (msg: string) => {
     setToast(msg);
-    window.setTimeout(() => setToast(''), 2500);
+    window.setTimeout(() => setToast(''), 3500);
   };
 
   // 加载设置与解密状态
   const loadAll = () => {
     setLoading(true);
-    Promise.all([api.getSettings(), api.getDecryptStatus()])
-      .then(([s, d]) => {
+    setLoadError('');
+    Promise.all([
+      api.getSettings(),
+      api.getDecryptStatus(),
+      api.getManualKeysJson(),
+      api.getDataDir(),
+    ])
+      .then(([s, d, mk, dd]) => {
         setSettings(s);
         setDecrypt(d);
         setLlmBase(s.llm_api_base || '');
         setLlmModel(s.llm_model || '');
         setRealtime(s.realtime_listen);
+        if (mk.has_keys && mk.keys_json) {
+          setMultiKeysJson(mk.keys_json);
+          setMultiKeysSaved(true);
+        }
+        if (dd.has_dir && dd.data_dir) {
+          setDataDir(dd.data_dir);
+          setDataDirSaved(true);
+        }
       })
-      .catch(() => {})
+      .catch((e) => {
+        // 后端不可达：记录错误而非静默吞掉
+        const msg = e instanceof Error ? e.message : String(e);
+        setLoadError(msg);
+      })
       .finally(() => setLoading(false));
   };
 
@@ -89,7 +118,7 @@ export default function Settings() {
       });
   };
 
-  // 保存手动密钥
+  // 保存手动密钥（单 key）
   const handleSaveKey = () => {
     if (!/^[0-9a-fA-F]{64}$/.test(manualKey)) {
       showToast('密钥需为 64 位 hex');
@@ -103,12 +132,54 @@ export default function Settings() {
       .finally(() => setBusy(false));
   };
 
-  // 触发解密
+  // 保存多密钥 JSON（4.0.x）
+  const handleSaveMultiKeys = () => {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(multiKeysJson);
+    } catch (e) {
+      showToast('JSON 格式错误：' + (e as Error).message);
+      return;
+    }
+    const keys = Object.keys(parsed);
+    if (keys.length === 0) {
+      showToast('JSON 为空');
+      return;
+    }
+    setBusy(true);
+    api
+      .setManualKeysJson({ keys_json: multiKeysJson })
+      .then(() => {
+        setMultiKeysSaved(true);
+        showToast(`多密钥 JSON 已保存（${keys.length} 个数据库）`);
+      })
+      .catch((e) => showToast('保存失败：' + e.message))
+      .finally(() => setBusy(false));
+  };
+
+  // 保存数据目录
+  const handleSaveDataDir = () => {
+    setBusy(true);
+    api
+      .setDataDir(dataDir.trim())
+      .then(() => {
+        setDataDirSaved(true);
+        showToast(dataDir.trim() ? '数据目录已保存' : '数据目录已清除');
+      })
+      .catch((e) => showToast('保存失败：' + e.message))
+      .finally(() => setBusy(false));
+  };
+
+  // 触发解密（如果有多密钥 JSON 则用 multi_keys 模式）
   const handleDecrypt = () => {
     setBusy(true);
     setDecryptResult(null);
+    const source = multiKeysJson.trim() ? 'multi_keys' : 'auto';
+    const body = source === 'multi_keys'
+      ? { source, manual_keys_json: multiKeysJson, data_dir: dataDir.trim() || undefined }
+      : { source, data_dir: dataDir.trim() || undefined };
     api
-      .triggerDecrypt({ source: 'auto' })
+      .triggerDecrypt(body)
       .then((r) => {
         setDecryptResult(r);
         showToast(r.message || '解密完成');
@@ -132,8 +203,36 @@ export default function Settings() {
   if (loading) return <Loading />;
   const isMac = navigator.platform.toLowerCase().includes('mac');
 
+  // 后端不可达错误（优先显示 Electron 传入的启动错误，其次显示 API 加载错误）
+  const fatalErr = backendError || loadError;
+
   return (
     <div>
+      {/* 后端启动/连接错误提示 */}
+      {fatalErr ? (
+        <div className="settings-section" style={{ borderColor: '#e74c3c' }}>
+          <div className="settings-section-title" style={{ color: '#e74c3c' }}>
+            {backendError ? '后端启动失败' : '后端连接失败'}
+          </div>
+          <div className="kv-list" style={{ wordBreak: 'break-all' }}>
+            <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, margin: 0 }}>
+              {fatalErr}
+            </pre>
+          </div>
+          <div className="muted text-sm" style={{ marginTop: 6 }}>
+            后端不可达时所有 API 调用都会返回 Failed to fetch。请确认：
+            <br />
+            1. 已安装 Python 3.10+（开发态）或 backend-runtime/wta-backend 存在（打包态）
+            <br />
+            2. 已执行 pip install -r requirements.txt
+            <br />
+            3. 端口 8765 未被占用
+            <br />
+            4. 杀毒软件/防火墙未拦截本地回环
+          </div>
+        </div>
+      ) : null}
+
       {/* 微信检测区 */}
       <div className="settings-section">
         <div className="settings-section-title">微信检测</div>
@@ -148,6 +247,12 @@ export default function Settings() {
           <div className="settings-row-label">数据目录</div>
           <div className="settings-row-value">
             {(settings?.wechat_data_dirs || []).join('；') || '-'}
+          </div>
+        </div>
+        <div className="settings-row">
+          <div className="settings-row-label">SQLCipher</div>
+          <div className="settings-row-value">
+            {settings?.sqlcipher_available ? '可用' : '不可用（需安装 pysqlcipher3 或 sqlcipher）'}
           </div>
         </div>
         {settings?.needs_resign && isMac ? (
@@ -170,6 +275,62 @@ export default function Settings() {
         ) : null}
       </div>
 
+      {/* 手动数据目录（自动检测失败时用） */}
+      <div className="settings-section">
+        <div className="settings-section-title">
+          <span>微信数据目录（手动指定）</span>
+          {dataDirSaved && dataDir ? <span className="badge">已保存</span> : null}
+        </div>
+        <div className="muted text-sm" style={{ marginBottom: 8 }}>
+          自动检测失败时，可手动填写微信数据目录的绝对路径。
+          该目录应包含 message/、contact/ 等子目录（含 .db 文件）。
+        </div>
+        <div className="settings-row">
+          <div className="settings-row-label">路径</div>
+          <input
+            className="input"
+            style={{ flex: 1 }}
+            value={dataDir}
+            placeholder="/Users/xxx/Library/Containers/com.tencent.xinWeChat/Data/.../2.0b4.0.9/<wxid>"
+            onChange={(e) => {
+              setDataDir(e.target.value);
+              setDataDirSaved(false);
+            }}
+          />
+          <button className="btn btn-primary" disabled={busy} onClick={handleSaveDataDir} style={{ marginLeft: 8 }}>
+            保存
+          </button>
+        </div>
+      </div>
+
+      {/* 多密钥 JSON 区（4.0.x） */}
+      <div className="settings-section">
+        <div className="settings-section-title">
+          <span>多密钥 JSON（微信 4.0.x）</span>
+          {multiKeysSaved ? <span className="badge">已保存</span> : null}
+        </div>
+        <div className="muted text-sm" style={{ marginBottom: 8 }}>
+          从 PyWxDump / wechat-decrypt 等工具导出的多数据库密钥 JSON。
+          格式：<code>{'{"message/message_0.db": {"enc_key": "..."}, ...}'}</code>
+        </div>
+        <textarea
+          className="input"
+          style={{ width: '100%', minHeight: 120, fontFamily: 'monospace', fontSize: 11 }}
+          placeholder={'{\n  "message/message_0.db": {"enc_key": "4fb2..."},\n  "contact/contact.db": {"enc_key": "6498..."}\n}'}
+          value={multiKeysJson}
+          onChange={(e) => {
+            setMultiKeysJson(e.target.value);
+            setMultiKeysSaved(false);
+          }}
+        />
+        <div className="settings-row">
+          <div className="settings-row-label" />
+          <button className="btn btn-primary" disabled={busy} onClick={handleSaveMultiKeys}>
+            保存多密钥 JSON
+          </button>
+        </div>
+      </div>
+
       {/* 解密区 */}
       <div className="settings-section">
         <div className="settings-section-title">数据解密</div>
@@ -185,13 +346,46 @@ export default function Settings() {
         </div>
         <div className="settings-row" style={{ marginTop: 10 }}>
           <button className="btn btn-primary" disabled={busy} onClick={handleDecrypt}>
-            {busy ? '解密中...' : '开始解密'}
+            {busy ? '解密中...' : multiKeysSaved ? '开始解密（多密钥）' : '开始解密'}
           </button>
+          <span className="muted text-sm" style={{ marginLeft: 10 }}>
+            {multiKeysSaved
+              ? '将使用已保存的多密钥 JSON 解密所有数据库'
+              : '需先保存多密钥 JSON 或配置手动密钥'}
+          </span>
         </div>
         {decryptResult ? (
           <div className="kv-list" style={{ marginTop: 8 }}>
+            <div>结果：{decryptResult.message}</div>
             <div>消息数：{decryptResult.msg_count}</div>
             <div>客户数：{decryptResult.contact_count}</div>
+            {decryptResult.db_results && decryptResult.db_results.length > 0 ? (
+              <details>
+                <summary>各数据库明细（{decryptResult.db_results.length} 个）</summary>
+                <table style={{ width: '100%', fontSize: 12, marginTop: 6 }}>
+                  <thead>
+                    <tr>
+                      <th>数据库</th>
+                      <th>状态</th>
+                      <th>消息</th>
+                      <th>联系人</th>
+                      <th>说明</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {decryptResult.db_results.map((r, i) => (
+                      <tr key={i}>
+                        <td>{r.db_path}</td>
+                        <td>{r.ok ? '✓' : '✗'}</td>
+                        <td>{r.msg_count}</td>
+                        <td>{r.contact_count}</td>
+                        <td>{r.message}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </details>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -261,9 +455,9 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* 手动密钥区 */}
+      {/* 单密钥区（3.x 或单一 key） */}
       <div className="settings-section">
-        <div className="settings-section-title">手动密钥</div>
+        <div className="settings-section-title">手动密钥（单 key，3.x 用）</div>
         <div className="settings-row">
           <div className="settings-row-label">64 位 Hex</div>
           <input

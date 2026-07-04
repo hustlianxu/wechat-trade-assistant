@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import io
+import os
 import platform
 import shutil
 import subprocess
@@ -26,10 +27,13 @@ from typing import Optional
 # 打包后 silk_decoder 的预期路径
 def _bundled_decoder_path() -> Path:
     """返回随应用打包的 silk_decoder 可执行文件路径。"""
-    here = Path(__file__).resolve().parent
-    # src/backend/stt/ → 上溯 4 层到项目根
-    project_root = here.parents[3]
-    bin_dir = project_root / "bin"
+    env = os.environ.get("WTA_BIN_DIR")
+    if env:
+        bin_dir = Path(env).expanduser().resolve()
+    else:
+        # 复用 config 模块的路径逻辑
+        from ..config import get_bin_dir
+        bin_dir = get_bin_dir()
     system = platform.system().lower()
     if system == "windows":
         return bin_dir / "windows" / "silk_v3_decoder.exe"

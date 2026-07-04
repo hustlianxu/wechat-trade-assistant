@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator, List, Optional
 
 from ..storage.models import Contact, Message
@@ -220,6 +222,18 @@ def to_message_model(parsed: ParsedMessage, contact_id: int) -> Message:
 # ----------------------------------------------------------------------------
 # 打开解密连接
 # ----------------------------------------------------------------------------
+def is_sqlcipher_available() -> bool:
+    """检测 SQLCipher 解密能力是否可用。"""
+    try:
+        from pysqlcipher3 import dbapi2  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    # 检查 sqlcipher CLI
+    import shutil
+    return shutil.which("sqlcipher") is not None
+
+
 def open_decrypted_db(
     db_path,
     key: bytes,
@@ -232,24 +246,78 @@ def open_decrypted_db(
         key: 32 字节密钥
         sqlcipher_compatibility: 3 或 4
 
-    需要 pysqlcipher3。沙箱环境若不可用会抛 RuntimeError。
+    需要 pysqlcipher3 或系统 sqlcipher CLI。沙箱环境若都不可用会抛 RuntimeError。
     """
+    # 优先 pysqlcipher3（Python 原生连接，性能最好）
     try:
         from pysqlcipher3 import dbapi2 as sqlcipher  # type: ignore
-    except ImportError as e:
-        raise RuntimeError(
-            "未安装 pysqlcipher3，无法解密微信数据库。"
-            "请在打包环境执行 pip install pysqlcipher3"
-        ) from e
+    except ImportError:
+        sqlcipher = None
 
-    conn = sqlcipher.connect(str(db_path))
-    conn.execute(f"PRAGMA key = \"x'{key.hex()}'\";")
-    conn.execute(f"PRAGMA cipher_compatibility = {sqlcipher_compatibility};")
-    # 验证可读
-    try:
-        conn.execute("SELECT count(*) FROM sqlite_master")
-    except Exception as e:  # noqa: BLE001
-        conn.close()
-        raise RuntimeError(f"密钥错误或数据库版本不匹配：{e}") from e
+    if sqlcipher is not None:
+        conn = sqlcipher.connect(str(db_path))
+        conn.execute(f"PRAGMA key = \"x'{key.hex()}'\";")
+        conn.execute(f"PRAGMA cipher_compatibility = {sqlcipher_compatibility};")
+        # 验证可读
+        try:
+            conn.execute("SELECT count(*) FROM sqlite_master")
+        except Exception as e:  # noqa: BLE001
+            conn.close()
+            raise RuntimeError(f"密钥错误或数据库版本不匹配：{e}") from e
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    # 回退：用系统 sqlcipher CLI 把加密库导出为明文临时库
+    return _open_via_sqlcipher_cli(db_path, key, sqlcipher_compatibility)
+
+
+def _open_via_sqlcipher_cli(
+    db_path,
+    key: bytes,
+    sqlcipher_compatibility: int,
+) -> sqlite3.Connection:
+    """用 sqlcipher CLI 解密数据库到临时文件，再用 sqlite3 打开。
+
+    适用于没有 pysqlcipher3 但系统装了 sqlcipher 的环境。
+    """
+    import os
+    import shutil
+    import tempfile
+
+    sqlcipher_bin = shutil.which("sqlcipher")
+    if sqlcipher_bin is None:
+        raise RuntimeError(
+            "未安装 pysqlcipher3，且系统无 sqlcipher 命令，无法解密微信数据库。"
+            "请执行 pip install pysqlcipher3，或安装 sqlcipher（macOS: brew install sqlcipher）。"
+        )
+
+    # 用 sqlcipher CLI 导出明文库
+    fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="wta_dec_")
+    os.close(fd)
+    os.unlink(tmp_path)  # sqlcipher 需要目标不存在
+
+    sql = (
+        f"PRAGMA key = \"x'{key.hex()}'\";\n"
+        f"PRAGMA cipher_compatibility = {sqlcipher_compatibility};\n"
+        f"ATTACH DATABASE '{tmp_path}' AS plaintext KEY '';\n"
+        f"SELECT sqlcipher_export('plaintext');\n"
+        f"DETACH DATABASE plaintext;\n"
+    )
+    result = subprocess.run(
+        [sqlcipher_bin, str(db_path)],
+        input=sql,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0 or not Path(tmp_path).exists():
+        raise RuntimeError(
+            f"sqlcipher CLI 解密失败：{result.stderr[:500] or result.stdout[:500]}"
+        )
+
+    conn = sqlite3.connect(tmp_path)
     conn.row_factory = sqlite3.Row
+    # 标记临时库路径，关闭时清理
+    conn._wta_tmp_path = tmp_path  # type: ignore[attr-defined]
     return conn

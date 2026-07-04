@@ -22,6 +22,8 @@ from .adapter import (
     WeChatGeneration,
     WeChatVersionInfo,
     detect_installed_wechat,
+    find_all_dbs,
+    find_all_msg_dbs,
     find_micro_msg_db,
     find_msg_db,
     find_wechat_data_dirs,
@@ -30,9 +32,12 @@ from .adapter import (
 from .extractor import (
     ExtractedKey,
     KeyExtractionError,
+    MultiKeyEntry,
     extract_key,
     make_manual_key,
+    parse_multi_keys_json,
     validate_manual_key,
+    validate_multi_keys_json,
 )
 from .image_decoder import decrypt_dat_image
 from .macos_helper import (
@@ -45,6 +50,7 @@ from .macos_helper import (
 from .parser import (
     ParsedContact,
     ParsedMessage,
+    is_sqlcipher_available,
     iter_contacts,
     iter_messages,
     open_decrypted_db,
@@ -61,21 +67,27 @@ __all__ = [
     "detect_installed_wechat",
     "find_wechat_data_dirs",
     "find_msg_db",
+    "find_all_msg_dbs",
+    "find_all_dbs",
     "find_micro_msg_db",
     "parse_version",
     "adapter",
     # extractor
     "ExtractedKey",
     "KeyExtractionError",
+    "MultiKeyEntry",
     "extract_key",
     "make_manual_key",
+    "parse_multi_keys_json",
     "validate_manual_key",
+    "validate_multi_keys_json",
     # parser
     "ParsedContact",
     "ParsedMessage",
     "iter_contacts",
     "iter_messages",
     "open_decrypted_db",
+    "is_sqlcipher_available",
     "to_contact_model",
     "to_message_model",
     "parser",

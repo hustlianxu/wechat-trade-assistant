@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 
@@ -18,18 +18,23 @@ from ..decrypt import (
     SSEConfig,
     detect_installed_wechat,
     extract_key,
-    find_msg_db,
+    find_all_dbs,
+    find_all_msg_dbs,
     find_micro_msg_db,
+    find_msg_db,
     find_wechat_data_dirs,
     is_resigned,
+    is_sqlcipher_available,
     iter_contacts,
     iter_messages,
     needs_resign,
     open_decrypted_db,
+    parse_multi_keys_json,
     perform_resign,
     to_contact_model,
     to_message_model,
     validate_manual_key,
+    validate_multi_keys_json,
 )
 from ..intent import classify as intent_classify
 from ..intent import classify_batch as intent_classify_batch
@@ -478,6 +483,7 @@ def get_settings() -> schemas.SettingsResponse:
         llm_api_key_set=bool(settings.get("llm_api_key", "")),
         whisper_available=whisper_engine.is_available(),
         intent_model_available=False,  # 暂未启用本地 Intento 模型
+        sqlcipher_available=is_sqlcipher_available(),
         db_path=str(get_app_data_dir() / "local.db"),
         data_dir=str(get_app_data_dir()),
     )
@@ -518,6 +524,49 @@ def set_manual_key(req: schemas.ManualKeyRequest) -> schemas.OkResponse:
     return schemas.OkResponse(message="密钥已保存")
 
 
+@router.post("/settings/manual-keys-json", response_model=schemas.OkResponse)
+def set_manual_keys_json(req: schemas.ManualKeysJsonRequest) -> schemas.OkResponse:
+    """保存微信 4.0.x 多数据库密钥 JSON。"""
+    if not validate_multi_keys_json(req.keys_json):
+        raise HTTPException(400, "多密钥 JSON 格式错误，应为 {db_path: {enc_key: hex64}} 结构")
+    repo = get_repo()
+    repo.set_setting("manual_keys_json", req.keys_json.strip())
+    return schemas.OkResponse(message=f"多密钥 JSON 已保存（{len(parse_multi_keys_json(req.keys_json))} 个数据库）")
+
+
+@router.get("/settings/manual-keys-json", response_model=dict)
+def get_manual_keys_json() -> dict:
+    """读取已保存的多密钥 JSON。"""
+    repo = get_repo()
+    raw = repo.get_setting("manual_keys_json", "")
+    return {"keys_json": raw, "has_keys": bool(raw)}
+
+
+@router.post("/settings/data-dir", response_model=schemas.OkResponse)
+def set_manual_data_dir(req: dict) -> schemas.OkResponse:
+    """保存手动指定的微信数据目录。"""
+    data_dir = (req.get("data_dir") or "").strip()
+    repo = get_repo()
+    if data_dir:
+        from pathlib import Path
+
+        p = Path(data_dir).expanduser()
+        if not p.exists():
+            raise HTTPException(400, f"目录不存在：{data_dir}")
+        repo.set_setting("manual_data_dir", str(p.resolve()))
+    else:
+        repo.set_setting("manual_data_dir", "")
+    return schemas.OkResponse(message="数据目录已保存")
+
+
+@router.get("/settings/data-dir", response_model=dict)
+def get_manual_data_dir() -> dict:
+    """读取手动指定的微信数据目录。"""
+    repo = get_repo()
+    raw = repo.get_setting("manual_data_dir", "")
+    return {"data_dir": raw, "has_dir": bool(raw)}
+
+
 # ============================================================================
 # 解密 / 导入
 # ============================================================================
@@ -540,34 +589,96 @@ def decrypt_status() -> schemas.DecryptStatusResponse:
 
 @router.post("/decrypt/trigger", response_model=schemas.DecryptTriggerResponse)
 def decrypt_trigger(req: schemas.DecryptTriggerRequest) -> schemas.DecryptTriggerResponse:
-    """触发一次完整的解密导入。"""
+    """触发一次完整的解密导入。
+
+    支持两种模式：
+    1. 单密钥（source=manual, manual_key=hex64）：适用于 3.x 或用户提供单一 key
+    2. 多密钥 JSON（source=multi_keys, manual_keys_json=json）：适用于 4.0.x 多数据库
+    3. 自动提取（source=auto）：从内存/注册表提取（需要相应权限）
+    """
     repo = get_repo()
     version_info = detect_installed_wechat()
+
+    # 若未检测到版本，但有手动密钥，构造一个默认 4.0 版本信息（用户可能从其他工具拿到 key）
     if version_info is None:
+        if req.manual_keys_json or (req.source == "multi_keys"):
+            from ..decrypt.adapter import WeChatGeneration, WeChatVersionInfo, Platform, _detect_platform
+            version_info = WeChatVersionInfo(
+                raw_version="4.0.0.0",
+                major=4, minor=0, patch=0, build=0,
+                generation=WeChatGeneration.GEN_4,
+                platform=_detect_platform(),
+                sqlcipher_compatibility=4,
+            )
+        elif req.manual_key:
+            from ..decrypt.adapter import WeChatGeneration, WeChatVersionInfo, _detect_platform
+            version_info = WeChatVersionInfo(
+                raw_version="4.0.0.0",
+                major=4, minor=0, patch=0, build=0,
+                generation=WeChatGeneration.GEN_4,
+                platform=_detect_platform(),
+                sqlcipher_compatibility=4,
+            )
+        else:
+            return schemas.DecryptTriggerResponse(
+                ok=False,
+                message="未检测到本机微信。请先安装并登录微信，或提供手动密钥/多密钥 JSON。",
+            )
+
+    # 检测 SQLCipher 可用性
+    if not is_sqlcipher_available():
         return schemas.DecryptTriggerResponse(
             ok=False,
-            message="未检测到本机微信，请先安装并登录微信",
+            message="未安装 pysqlcipher3 且系统无 sqlcipher 命令，无法解密。请安装 pysqlcipher3 或 sqlcipher。",
         )
 
     started_ts = int(time.time())
-    try:
-        key = extract_key(
-            version_info,
-            source=req.source,
-            manual_key=req.manual_key,
+    data_dirs = find_wechat_data_dirs(version_info)
+
+    # 手动指定数据目录（优先级：请求参数 > 已保存设置 > 自动检测）
+    manual_dir = (req.data_dir or "").strip() or repo.get_setting("manual_data_dir", "")
+    if manual_dir:
+        from pathlib import Path
+
+        manual_path = Path(manual_dir).expanduser()
+        if manual_path.exists():
+            # 手动指定的目录优先于自动检测
+            data_dirs = [manual_path] + data_dirs
+
+    # ---- 多密钥 JSON 模式（4.0.x） ----
+    multi_keys_raw = req.manual_keys_json
+    if not multi_keys_raw and req.source != "multi_keys":
+        # 也尝试从 settings 读取之前保存的多密钥 JSON
+        multi_keys_raw = repo.get_setting("manual_keys_json", "")
+
+    if multi_keys_raw and (req.source in ("multi_keys", "auto", "manual") or req.manual_keys_json):
+        return _decrypt_with_multi_keys(
+            repo, version_info, data_dirs, multi_keys_raw, started_ts, req.wxid
         )
+
+    # ---- 单密钥模式 ----
+    try:
+        if req.source == "manual" and req.manual_key:
+            from ..decrypt import make_manual_key
+            key = make_manual_key(req.manual_key)
+        elif req.source == "auto" and repo.get_setting("manual_key_hex", ""):
+            from ..decrypt import make_manual_key
+            key = make_manual_key(repo.get_setting("manual_key_hex", ""))
+        else:
+            key = extract_key(
+                version_info,
+                source=req.source,
+                manual_key=req.manual_key,
+            )
     except KeyExtractionError as e:
         return schemas.DecryptTriggerResponse(ok=False, message=f"密钥提取失败：{e}")
 
-    data_dirs = find_wechat_data_dirs(version_info)
     if not data_dirs:
         return schemas.DecryptTriggerResponse(
             ok=False,
             message="未找到微信数据目录，请确认微信已登录",
         )
     data_dir = data_dirs[0]
-    if req.wxid:
-        data_dir = data_dir / req.wxid if hasattr(data_dir, "__truediv__") else data_dir
 
     msg_db = find_msg_db(version_info, data_dir)
     micro_db = find_micro_msg_db(version_info, data_dir)
@@ -578,6 +689,7 @@ def decrypt_trigger(req: schemas.DecryptTriggerRequest) -> schemas.DecryptTrigge
             message="未找到微信数据库文件",
         )
 
+    db_results: List[schemas.DecryptDbResult] = []
     contact_count = 0
     msg_count = 0
 
@@ -594,18 +706,19 @@ def decrypt_trigger(req: schemas.DecryptTriggerRequest) -> schemas.DecryptTrigge
                     contact_count += 1
             finally:
                 conn.close()
+            db_results.append(schemas.DecryptDbResult(
+                db_path=str(micro_db), ok=True, message="联系人导入完成", contact_count=contact_count
+            ))
         except Exception as e:  # noqa: BLE001
-            return schemas.DecryptTriggerResponse(
-                ok=False,
-                message=f"联系人库解密失败：{e}",
-            )
+            db_results.append(schemas.DecryptDbResult(
+                db_path=str(micro_db), ok=False, message=f"联系人库解密失败：{e}"
+            ))
 
     # 2. 消息
     if msg_db is not None:
         try:
             conn = open_decrypted_db(msg_db, key.key_bytes, version_info.sqlcipher_compatibility)
             try:
-                # 先建立 wxid → contact_id 映射
                 wxid_to_id = {c.wxid: c.id for c in repo.list_contacts() if c.id}
                 msgs_to_insert: List[Message] = []
                 for parsed in iter_messages(conn, version_info):
@@ -622,11 +735,13 @@ def decrypt_trigger(req: schemas.DecryptTriggerRequest) -> schemas.DecryptTrigge
                     msg_count += len(msgs_to_insert)
             finally:
                 conn.close()
+            db_results.append(schemas.DecryptDbResult(
+                db_path=str(msg_db), ok=True, message="消息导入完成", msg_count=msg_count
+            ))
         except Exception as e:  # noqa: BLE001
-            return schemas.DecryptTriggerResponse(
-                ok=False,
-                message=f"消息库解密失败：{e}",
-            )
+            db_results.append(schemas.DecryptDbResult(
+                db_path=str(msg_db), ok=False, message=f"消息库解密失败：{e}"
+            ))
 
     finished_ts = int(time.time())
     repo.record_decrypt_run(
@@ -643,6 +758,146 @@ def decrypt_trigger(req: schemas.DecryptTriggerRequest) -> schemas.DecryptTrigge
         message=f"解密完成：导入 {contact_count} 个联系人，{msg_count} 条消息",
         msg_count=msg_count,
         contact_count=contact_count,
+        db_results=db_results,
+    )
+
+
+def _decrypt_with_multi_keys(
+    repo,
+    version_info,
+    data_dirs: list,
+    keys_json_raw: str,
+    started_ts: int,
+    wxid: Optional[str],
+) -> schemas.DecryptTriggerResponse:
+    """使用多密钥 JSON 解密微信 4.0.x 的多个数据库。
+
+    用户的 JSON 格式：
+        {
+          "message/message_0.db": {"enc_key": "..."},
+          "contact/contact.db": {"enc_key": "..."},
+          ...
+        }
+    """
+    try:
+        multi_keys = parse_multi_keys_json(keys_json_raw)
+    except KeyExtractionError as e:
+        return schemas.DecryptTriggerResponse(ok=False, message=str(e))
+
+    if not multi_keys:
+        return schemas.DecryptTriggerResponse(ok=False, message="多密钥 JSON 为空")
+
+    if not data_dirs:
+        return schemas.DecryptTriggerResponse(
+            ok=False,
+            message="未找到微信数据目录，请确认微信已登录或手动指定数据目录",
+        )
+
+    # 选择第一个数据目录（如果有 wxid 则匹配）
+    data_dir = data_dirs[0]
+    if wxid:
+        for d in data_dirs:
+            if d.name == wxid or wxid in str(d):
+                data_dir = d
+                break
+
+    # 找出所有 .db 文件
+    all_dbs = find_all_dbs(version_info, data_dir)
+
+    db_results: List[schemas.DecryptDbResult] = []
+    total_msg_count = 0
+    total_contact_count = 0
+
+    # wxid → contact_id 映射，跨库复用
+    wxid_to_id: dict[str, int] = {c.wxid: c.id for c in repo.list_contacts() if c.id}
+
+    # 先解密联系人库
+    contact_db_keys = {k: v for k, v in multi_keys.items() if "contact" in k.lower()}
+    for rel_path, key_entry in contact_db_keys.items():
+        db_path = all_dbs.get(rel_path)
+        if db_path is None or not db_path.exists():
+            db_results.append(schemas.DecryptDbResult(
+                db_path=rel_path, ok=False, message="数据库文件未找到"
+            ))
+            continue
+        try:
+            conn = open_decrypted_db(db_path, key_entry.key_bytes, version_info.sqlcipher_compatibility)
+            try:
+                count = 0
+                for parsed in iter_contacts(conn, version_info):
+                    contact = to_contact_model(parsed)
+                    cid = repo.upsert_contact(contact)
+                    wxid_to_id[parsed.wxid] = cid
+                    count += 1
+                total_contact_count += count
+                db_results.append(schemas.DecryptDbResult(
+                    db_path=str(db_path), ok=True, message=f"导入 {count} 个联系人", contact_count=count
+                ))
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001
+            db_results.append(schemas.DecryptDbResult(
+                db_path=str(db_path), ok=False, message=f"解密失败：{e}"
+            ))
+
+    # 再解密消息库（所有 message_*.db）
+    msg_db_keys = {k: v for k, v in multi_keys.items() if "message" in k.lower() and "fts" not in k.lower() and "biz" not in k.lower()}
+    for rel_path, key_entry in msg_db_keys.items():
+        db_path = all_dbs.get(rel_path)
+        if db_path is None or not db_path.exists():
+            db_results.append(schemas.DecryptDbResult(
+                db_path=rel_path, ok=False, message="数据库文件未找到"
+            ))
+            continue
+        try:
+            conn = open_decrypted_db(db_path, key_entry.key_bytes, version_info.sqlcipher_compatibility)
+            try:
+                msgs_to_insert: List[Message] = []
+                db_msg_count = 0
+                for parsed in iter_messages(conn, version_info):
+                    cid = wxid_to_id.get(parsed.talker_wxid)
+                    if cid is None:
+                        # 联系人不存在时也创建占位联系人
+                        from ..storage.models import Contact
+                        cid = repo.upsert_contact(Contact(wxid=parsed.talker_wxid))
+                        wxid_to_id[parsed.talker_wxid] = cid
+                    msgs_to_insert.append(to_message_model(parsed, cid))
+                    if len(msgs_to_insert) >= 1000:
+                        repo.insert_messages_bulk(msgs_to_insert)
+                        db_msg_count += len(msgs_to_insert)
+                        msgs_to_insert = []
+                if msgs_to_insert:
+                    repo.insert_messages_bulk(msgs_to_insert)
+                    db_msg_count += len(msgs_to_insert)
+                total_msg_count += db_msg_count
+                db_results.append(schemas.DecryptDbResult(
+                    db_path=str(db_path), ok=True, message=f"导入 {db_msg_count} 条消息", msg_count=db_msg_count
+                ))
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001
+            db_results.append(schemas.DecryptDbResult(
+                db_path=str(db_path), ok=False, message=f"解密失败：{e}"
+            ))
+
+    finished_ts = int(time.time())
+    repo.record_decrypt_run(
+        wechat_version=version_info.raw_version,
+        db_path=str(data_dir),
+        key_source="multi_keys",
+        msg_count=total_msg_count,
+        started_ts=started_ts,
+        finished_ts=finished_ts,
+    )
+
+    success_count = sum(1 for r in db_results if r.ok)
+    return schemas.DecryptTriggerResponse(
+        ok=success_count > 0,
+        message=f"解密完成：{success_count}/{len(db_results)} 个数据库成功，"
+                f"导入 {total_contact_count} 个联系人，{total_msg_count} 条消息",
+        msg_count=total_msg_count,
+        contact_count=total_contact_count,
+        db_results=db_results,
     )
 
 
