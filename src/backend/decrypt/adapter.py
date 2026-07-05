@@ -244,13 +244,27 @@ def find_wechat_data_dirs(version: WeChatVersionInfo) -> list[Path]:
         candidates.append(Path.home() / ".config" / "WeChat")
 
     # 去重并过滤存在的
+    _EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e"  # MD5("")，空用户目录，应排除
     seen = set()
     result = []
     for p in candidates:
         key = str(p.resolve())
-        if key not in seen and p.exists():
+        if key not in seen and p.exists() and _EMPTY_MD5 not in str(p):
             seen.add(key)
             result.append(p)
+
+    # 在 macOS 4.x 环境下，将含 message/message_*.db 的 4.x 结构目录优先于 3.x 遗留目录
+    if plat == Platform.MACOS and version.generation == WeChatGeneration.GEN_4:
+        _4x_candidates = []
+        _3x_candidates = []
+        for p in result:
+            msg_dir = p / "message"
+            if msg_dir.is_dir() and list(msg_dir.glob("message_*.db")):
+                _4x_candidates.append(p)
+            else:
+                _3x_candidates.append(p)
+        result = _4x_candidates + _3x_candidates
+
     return result
 
 

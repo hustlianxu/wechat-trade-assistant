@@ -40,12 +40,31 @@ hiddenimports += [
     'uvicorn.protocols.http.auto',
     'uvicorn.protocols.websockets.auto',
     'uvicorn.loops.auto',
+    # SILK 语音解码（C 扩展，需显式声明）
+    'pilk',
+    # Zstandard 压缩（消息内容解压）
+    'zstandard',
 ]
 
 # 数据文件：schema.sql 必须随包
 datas = [
     ('../src/backend/storage/schema.sql', 'backend/storage'),
 ]
+
+# 随应用打包的二进制资产（sqlcipher 等）
+# Note: PyInstaller 6.21.0 提供 SPECPATH（spec 文件所在目录）
+# 见 build_main.py spec_namespace 定义
+import os as _os
+_bin_dir = _os.path.join(SPECPATH, '..', 'bin')
+if _os.path.isdir(_bin_dir):
+    for _root, _dirs, _files in _os.walk(_bin_dir):
+        for _f in _files:
+            _src = _os.path.join(_root, _f)
+            _rel = _os.path.relpath(_root, _os.path.dirname(_bin_dir))  # "bin/macos"
+            # 排除过大或不必要的文件
+            if _os.path.getsize(_src) > 50 * 1024 * 1024:
+                continue
+            datas.append((_src, _rel.replace(_os.sep, '/')))
 
 a = Analysis(
     ['../src/backend/launcher.py'],

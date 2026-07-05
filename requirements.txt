@@ -8,6 +8,11 @@ regex>=2024.0.0
 python-dateutil>=2.8.2
 httpx>=0.27.0
 
+# 微信消息内容 Zstandard 解压
+zstandard>=0.22
+# SILK 语音解码（纯 Python + C 扩展，支持 macOS/Linux/Windows）
+pilk>=0.2.0
+
 # 开发
 pytest>=8.0.0
 pytest-asyncio>=0.23.0

@@ -58,12 +58,27 @@ def get_models_dir() -> Path:
 
 
 def get_bin_dir() -> Path:
-    """获取随应用打包的二进制目录（whisper-cli、silk_decoder）。"""
+    """获取随应用打包的二进制目录（whisper-cli、silk_decoder、sqlcipher）。"""
     env = os.environ.get("WTA_BIN_DIR")
     if env:
         return Path(env).expanduser().resolve()
     here = Path(__file__).resolve().parents[2]
-    return here / "bin"
+    bin_dir = here / "bin"
+
+    # 打包态：PyInstaller 将 datas 放入 _internal/ 目录下
+    if getattr(sys, "frozen", False):
+        if hasattr(sys, "_MEIPASS"):
+            # _MEIPASS 指向 _internal/ 目录
+            alt = Path(sys._MEIPASS) / "bin"
+            if alt.exists():
+                bin_dir = alt
+        # 也尝试 _MEIPASS 的父级
+        if not bin_dir.exists():
+            alt2 = here / "bin"
+            if alt2.exists():
+                bin_dir = alt2
+
+    return bin_dir
 
 
 # ----------------------------------------------------------------------------

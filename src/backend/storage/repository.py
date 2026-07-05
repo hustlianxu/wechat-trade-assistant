@@ -122,16 +122,36 @@ class Repository:
             row = cur.fetchone()
             return row["id"]
 
-    def list_contacts(self, intent: Optional[str] = None) -> List[Contact]:
+    def list_contacts(
+        self,
+        intent: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> List[Contact]:
         conn = self.db.connect()
         if intent:
             cur = conn.execute(
-                "SELECT * FROM contacts WHERE last_intent = ? ORDER BY updated_at DESC",
+                "SELECT * FROM contacts WHERE last_intent = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (intent, limit, offset),
+            )
+        else:
+            cur = conn.execute(
+                "SELECT * FROM contacts ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        return [_row_to_contact(r) for r in cur.fetchall()]
+
+    def count_contacts(self, intent: Optional[str] = None) -> int:
+        conn = self.db.connect()
+        if intent:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM contacts WHERE last_intent = ?",
                 (intent,),
             )
         else:
-            cur = conn.execute("SELECT * FROM contacts ORDER BY updated_at DESC")
-        return [_row_to_contact(r) for r in cur.fetchall()]
+            cur = conn.execute("SELECT COUNT(*) FROM contacts")
+        row = cur.fetchone()
+        return row[0] if row else 0
 
     def get_contact(self, contact_id: int) -> Optional[Contact]:
         conn = self.db.connect()
@@ -261,6 +281,26 @@ class Repository:
         cur = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
         row = cur.fetchone()
         return _row_to_message(row) if row else None
+
+    def get_messages_by_types(self, types: list[str], limit: int = 5000) -> list[Message]:
+        """按消息类型查询消息（用于媒体文件批量解析）。"""
+        conn = self.db.connect()
+        placeholders = ",".join("?" for _ in types)
+        cur = conn.execute(
+            f"SELECT * FROM messages WHERE msg_type IN ({placeholders})"
+            f" AND raw_path = '' AND content != ''"
+            f" ORDER BY created_ts DESC LIMIT {limit}",
+            types,
+        )
+        return [_row_to_message(r) for r in cur.fetchall() if r]
+
+    def update_message_raw_path(self, msg_id: str, raw_path: str) -> None:
+        """更新消息的 raw_path（媒体文件路径）。"""
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE messages SET raw_path = ? WHERE msg_id = ?",
+                (raw_path, msg_id),
+            )
 
     def list_messages(
         self,

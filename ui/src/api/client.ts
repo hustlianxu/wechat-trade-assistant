@@ -68,8 +68,11 @@ export const api = {
   getDashboard: () => request<DashboardData>('/api/dashboard'),
 
   // ===== 客户 =====
-  listContacts: (intent?: string) =>
-    request<ContactListResponse>(`/api/contacts${qs({ intent })}`),
+  listContacts: (p?: string | { intent?: string; q?: string; limit?: number; offset?: number }) => {
+    // 兼容旧式调用：api.listContacts('intent_name')
+    const params = typeof p === 'string' ? { intent: p || undefined } : p;
+    return request<ContactListResponse>(`/api/contacts${qs(params as Record<string, any>)}`);
+  },
   getContact: (id: number) => request<ContactOut>(`/api/contacts/${id}`),
   getContactMessages: (
     id: number,

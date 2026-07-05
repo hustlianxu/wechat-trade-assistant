@@ -16,6 +16,7 @@ from ..decrypt import (
     KeyExtractionError,
     PollingListener,
     SSEConfig,
+    WeChatGeneration,
     detect_installed_wechat,
     extract_key,
     find_all_dbs,
@@ -51,6 +52,8 @@ from ..storage.models import (
     Todo,
 )
 from ..storage.repository import matched_ids_str, query_filter_to_text
+import threading as _threading
+
 from ..stt import WhisperEngine, get_default_engine as get_default_stt_engine
 from ..todo import TodoManager
 from . import schemas
@@ -62,7 +65,61 @@ router = APIRouter(prefix="/api")
 # ============================================================================
 # 工具
 # ============================================================================
-def _contact_to_out(c: Contact) -> schemas.ContactOut:
+def _launch_media_resolution(
+    repo,
+    data_dir,
+    multi_keys: dict,
+    version_info,
+    wxid: str = "",
+) -> None:
+    """在后台线程中解析图片缓存文件，不阻塞解密响应。"""
+    t = _threading.Thread(
+        target=_resolve_images_in_background,
+        args=(repo, data_dir),
+        daemon=True,
+        name="media-resolver",
+    )
+    t.start()
+
+
+def _resolve_images_in_background(repo, data_dir):
+    """后台扫描 cache/ 目录解密图片，更新 raw_path。"""
+    import time as _time
+    try:
+        from ..config import get_app_data_dir
+        from ..decrypt.image_decoder import decrypt_dat_image
+        from pathlib import Path
+
+        wechat_base_dir = data_dir
+        if data_dir.name == "db_storage" and data_dir.parent.exists():
+            wechat_base_dir = data_dir.parent
+
+        cache_dir = wechat_base_dir / "cache"
+        if not cache_dir.exists():
+            return
+
+        assets_dir = get_app_data_dir() / "assets"
+        out_dir = assets_dir / "images"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # 单次扫描 cache 目录，解密所有 .dat 文件
+        resolved = 0
+        for dat_path in cache_dir.rglob("*_b.dat"):
+            if dat_path.stat().st_size < 100:
+                continue
+            out_path = out_dir / f"{dat_path.stem}.jpg"
+            if out_path.exists():
+                continue
+            try:
+                decrypt_dat_image(dat_path, out_path)
+                resolved += 1
+            except Exception:
+                continue
+
+        if resolved:
+            repo.set_setting("media_resolved_ts", str(int(_time.time())))
+    except Exception:
+        pass
     return schemas.ContactOut(
         id=c.id,
         wxid=c.wxid,
@@ -73,6 +130,20 @@ def _contact_to_out(c: Contact) -> schemas.ContactOut:
         last_intent=c.last_intent,
         last_intent_ts=c.last_intent_ts,
         last_msg_ts=c.last_msg_ts,
+        note=c.note,
+    )
+
+
+def _contact_to_out(c: Contact) -> schemas.ContactOut:
+    return schemas.ContactOut(
+        id=c.id,
+        wxid=c.wxid,
+        nickname=c.nickname,
+        remark=c.remark,
+        alias=c.alias,
+        region=c.region,
+        last_intent=c.last_intent,
+        updated_at=c.updated_at,
         note=c.note,
     )
 
@@ -170,12 +241,27 @@ def dashboard() -> schemas.DashboardData:
 # 联系人
 # ============================================================================
 @router.get("/contacts", response_model=schemas.ContactListResponse)
-def list_contacts(intent: str | None = None) -> schemas.ContactListResponse:
+def list_contacts(
+    intent: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    q: str = "",
+) -> schemas.ContactListResponse:
+    """客户列表（支持分页和关键字搜索）。
+
+    - limit/offset: 分页，默认每次 200 条
+    - q: 按昵称/备注/wxid 搜索
+    - intent: 按意向筛选
+    """
     repo = get_repo()
-    contacts = repo.list_contacts(intent=intent)
+    if q:
+        contacts = repo.find_contacts_by_keyword(q)
+    else:
+        contacts = repo.list_contacts(intent=intent, limit=limit, offset=offset)
+    total = repo.count_contacts(intent=intent) if not q else len(contacts)
     return schemas.ContactListResponse(
         contacts=[_contact_to_out(c) for c in contacts],
-        total=len(contacts),
+        total=total,
     )
 
 
@@ -812,32 +898,47 @@ def _decrypt_with_multi_keys(
                 return True
         return False
 
+    def _is_4x_account_root(d: Path) -> bool:
+        """判断是否为 4.x 账号根目录：含小写 message/ 且其中有 message_*.db。"""
+        msg_dir = d / "message"
+        if msg_dir.is_dir():
+            return any(msg_dir.glob("message_*.db"))
+        return False
+
     def _scan_dbs(d: Path) -> dict:
         try:
             return find_all_dbs(version_info, d)
         except Exception:
             return {}
 
-    # 按优先级收集所有候选目录的 db 索引：账号根目录在前，父目录在后
-    account_dirs: list[tuple[Path, dict]] = []
+    # 按优先级收集所有候选目录的 db 索引：4.x 账号根目录优先，3.x 账号根目录其次，父目录兜底
+    gen4_account_dirs: list[tuple[Path, dict]] = []
+    gen3_account_dirs: list[tuple[Path, dict]] = []
     parent_dirs: list[tuple[Path, dict]] = []
     for d in data_dirs:
         dbs = _scan_dbs(d)
         if not dbs:
             continue
-        if _is_account_root(d):
-            account_dirs.append((d, dbs))
+        if _is_4x_account_root(d):
+            gen4_account_dirs.append((d, dbs))
+        elif _is_account_root(d) and version_info.generation == WeChatGeneration.GEN_4:
+            # 在 4.x 检测环境下的非 4.x 账号根目录（如 3.x 遗留目录），放最后
+            gen3_account_dirs.append((d, dbs))
+        elif _is_account_root(d):
+            gen3_account_dirs.append((d, dbs))
         else:
             parent_dirs.append((d, dbs))
 
-    # 排序：账号目录按 db 数量降序（多的优先）；wxid 匹配的排最前
+    # 排序：4.x 账号目录优先，按 wxid 匹配 + db 数量降序
     def _dir_sort_key(item: tuple[Path, dict]) -> tuple:
         d, dbs = item
         wxid_match = 1 if (wxid and (d.name == wxid or wxid in str(d))) else 0
         return (-wxid_match, -len(dbs))
 
-    account_dirs.sort(key=_dir_sort_key)
-    all_search_dirs = account_dirs + parent_dirs
+    gen4_account_dirs.sort(key=_dir_sort_key)
+    gen3_account_dirs.sort(key=_dir_sort_key)
+    # 4.x 环境只含 4.x 目录；含遗留 3.x 目录仅作兜底
+    all_search_dirs = gen4_account_dirs + gen3_account_dirs + parent_dirs
 
     if not all_search_dirs:
         tried_paths = "; ".join(str(d) for d in data_dirs[:5])
@@ -930,7 +1031,9 @@ def _decrypt_with_multi_keys(
             try:
                 msgs_to_insert: List[Message] = []
                 db_msg_count = 0
-                for parsed in iter_messages(conn, version_info):
+                # 微信 4.x 使用 Msg_<md5(username)> 频道表，需要 self_wxid 判断 is_self
+                self_wxid = wxid or ""
+                for parsed in iter_messages(conn, version_info, self_wxid=self_wxid):
                     cid = wxid_to_id.get(parsed.talker_wxid)
                     if cid is None:
                         # 联系人不存在时也创建占位联系人
@@ -959,6 +1062,7 @@ def _decrypt_with_multi_keys(
                 db_path=str(db_path), ok=False, message=f"解密失败：{err_msg}"
             ))
 
+    # ---- 记录解密完成 ----
     finished_ts = int(time.time())
     repo.record_decrypt_run(
         wechat_version=version_info.raw_version,
@@ -969,11 +1073,19 @@ def _decrypt_with_multi_keys(
         finished_ts=finished_ts,
     )
 
+    # ---- 在后台启动媒体文件解析（不阻塞解密流程）----
+    if total_msg_count > 0:
+        _launch_media_resolution(repo, data_dir, multi_keys, version_info, wxid)
+
     success_count = sum(1 for r in db_results if r.ok)
+    result_msg = (
+        f"解密完成：{success_count}/{len(db_results)} 个数据库成功，"
+        f"导入 {total_contact_count} 个联系人，{total_msg_count} 条消息"
+    )
+
     return schemas.DecryptTriggerResponse(
         ok=success_count > 0,
-        message=f"解密完成：{success_count}/{len(db_results)} 个数据库成功，"
-                f"导入 {total_contact_count} 个联系人，{total_msg_count} 条消息",
+        message=result_msg,
         msg_count=total_msg_count,
         contact_count=total_contact_count,
         db_results=db_results,

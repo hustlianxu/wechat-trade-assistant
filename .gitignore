@@ -49,3 +49,17 @@ installers/build/
 *.dmg
 *.exe
 *.app
+
+# Build outputs
+dist-python/
+build/
+bin/macos/sqlcipher
+ui/dist/
+*.dmg
+*.zip
+*.blockmap
+
+# PyInstaller
+*.spec.py
+__pycache__/
+*.pyc
