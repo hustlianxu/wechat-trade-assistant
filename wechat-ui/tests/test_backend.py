@@ -1,0 +1,421 @@
+"""后端测试：使用模拟的解密数据库验证 DbReader 和 API 逻辑。
+
+测试策略：在临时目录创建模拟的 SQLite 数据库（contact.db, session.db, message_*.db, media_*.db），
+模拟 wechat-decrypt 解密后的数据库结构，验证 DbReader 能正确读取。
+"""
+
+import hashlib
+import sqlite3
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from backend.db_reader import (
+    DbReader, Contact, Message,
+    split_msg_type, msg_type_name,
+    MSG_TYPE_TEXT, MSG_TYPE_VOICE, MSG_TYPE_IMAGE,
+)
+
+
+# ============================================================================
+# 测试夹具：创建模拟的解密数据库
+# ============================================================================
+@pytest.fixture
+def mock_decrypted_dir():
+    """创建模拟的解密数据库目录。"""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+
+        # 1. contact.db
+        contact_dir = base / "contact"
+        contact_dir.mkdir()
+        conn = sqlite3.connect(str(contact_dir / "contact.db"))
+        conn.execute("""
+            CREATE TABLE contact (
+                username TEXT, nick_name TEXT, remark TEXT, alias TEXT,
+                description TEXT, local_type INTEGER
+            )
+        """)
+        conn.execute("INSERT INTO contact VALUES (?, ?, ?, ?, ?, ?)",
+                     ("wxid_friend1", "好友一", "备注好友一", "friend1", "描述1", 1))
+        conn.execute("INSERT INTO contact VALUES (?, ?, ?, ?, ?, ?)",
+                     ("wxid_friend2", "好友二", "", "friend2", "", 1))
+        conn.execute("INSERT INTO contact VALUES (?, ?, ?, ?, ?, ?)",
+                     ("group1@chatroom", "外贸群", "", "", "群描述", 2))
+        conn.execute("INSERT INTO contact VALUES (?, ?, ?, ?, ?, ?)",
+                     ("wxid_self", "我自己", "", "self", "", 1))
+        conn.commit()
+        conn.close()
+
+        # 2. session.db
+        session_dir = base / "session"
+        session_dir.mkdir()
+        conn = sqlite3.connect(str(session_dir / "session.db"))
+        conn.execute("""
+            CREATE TABLE SessionTable (
+                username TEXT, summary TEXT, last_timestamp INTEGER,
+                last_msg_type INTEGER, unread_count INTEGER
+            )
+        """)
+        conn.execute("INSERT INTO SessionTable VALUES (?, ?, ?, ?, ?)",
+                     ("wxid_friend1", "你好，价格多少？", 1700000000, 1, 2))
+        conn.execute("INSERT INTO SessionTable VALUES (?, ?, ?, ?, ?)",
+                     ("group1@chatroom", "wxid_friend1:\n大家在吗", 1700000100, 1, 5))
+        conn.execute("INSERT INTO SessionTable VALUES (?, ?, ?, ?, ?)",
+                     ("wxid_friend2", "好的", 1699999900, 1, 0))
+        conn.commit()
+        conn.close()
+
+        # 3. message_0.db
+        msg_dir = base / "message"
+        msg_dir.mkdir()
+        conn = sqlite3.connect(str(msg_dir / "message_0.db"))
+
+        # Name2Id 表
+        conn.execute("CREATE TABLE Name2Id (rowid INTEGER PRIMARY KEY, user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id (user_name) VALUES (?)", ("wxid_self",))
+        conn.execute("INSERT INTO Name2Id (user_name) VALUES (?)", ("wxid_friend1",))
+
+        # 消息表：Msg_<md5(username)>
+        table_name = f"Msg_{hashlib.md5(b'wxid_friend1').hexdigest()}"
+        conn.execute(f"""
+            CREATE TABLE "{table_name}" (
+                local_id INTEGER PRIMARY KEY,
+                server_id INTEGER,
+                local_type INTEGER,
+                create_time INTEGER,
+                real_sender_id INTEGER,
+                message_content TEXT,
+                WCDB_CT_message_content INTEGER DEFAULT 0
+            )
+        """)
+        # 对方发文本
+        conn.execute(f'INSERT INTO "{table_name}" VALUES (?, ?, ?, ?, ?, ?, ?)',
+                     (1, 1001, 1, 1700000000, 2, "你好，价格多少？", 0))
+        # 自己回文本
+        conn.execute(f'INSERT INTO "{table_name}" VALUES (?, ?, ?, ?, ?, ?, ?)',
+                     (2, 1002, 1, 1700000010, 1, "100美元一个", 0))
+        # 对方发语音
+        conn.execute(f'INSERT INTO "{table_name}" VALUES (?, ?, ?, ?, ?, ?, ?)',
+                     (3, 1003, 34, 1700000020, 2, "<voicemsg voicelength='5000'/>", 0))
+        conn.commit()
+        conn.close()
+
+        # 4. media_0.db（语音数据）
+        conn = sqlite3.connect(str(msg_dir / "media_0.db"))
+        conn.execute("CREATE TABLE Name2Id (rowid INTEGER PRIMARY KEY, user_name TEXT)")
+        conn.execute("INSERT INTO Name2Id (user_name) VALUES (?)", ("wxid_friend1",))
+
+        conn.execute("""
+            CREATE TABLE VoiceInfo (
+                chat_name_id INTEGER,
+                local_id INTEGER,
+                create_time INTEGER,
+                voice_data BLOB
+            )
+        """)
+        # 模拟 SILK 数据（首字节 0x02 + 假数据）
+        fake_silk = b"\x02" + b"\x00" * 100
+        conn.execute("INSERT INTO VoiceInfo VALUES (?, ?, ?, ?)",
+                     (1, 3, 1700000020, fake_silk))
+        conn.commit()
+        conn.close()
+
+        yield str(base)
+
+
+# ============================================================================
+# 消息类型工具函数测试
+# ============================================================================
+class TestMsgType:
+    def test_split_simple(self):
+        assert split_msg_type(1) == (1, 0)
+        assert split_msg_type(34) == (34, 0)
+
+    def test_split_composite(self):
+        # sub_type=5, base_type=3 → (3 << 32) | 5 = 12884901891
+        composite = (5 << 32) | 3
+        assert split_msg_type(composite) == (3, 5)
+
+    def test_msg_type_name(self):
+        assert msg_type_name(1) == "文本"
+        assert msg_type_name(34) == "语音"
+        assert msg_type_name(3) == "图片"
+        assert msg_type_name(49) == "链接/文件"
+        assert msg_type_name(999) == "未知(999)"
+
+
+# ============================================================================
+# DbReader 测试
+# ============================================================================
+class TestDbReader:
+    def test_init(self, mock_decrypted_dir):
+        """测试初始化能找到所有数据库。"""
+        reader = DbReader(mock_decrypted_dir)
+        assert reader.contact_db is not None
+        assert reader.session_db is not None
+        assert len(reader.message_dbs) == 1
+        assert len(reader.media_dbs) == 1
+
+    def test_list_friends(self, mock_decrypted_dir):
+        """测试好友列表（排除自己和群聊）。"""
+        reader = DbReader(mock_decrypted_dir)
+        friends = reader.list_contacts(contact_type="friends", sort="name", self_wxid="wxid_self")
+        assert len(friends) == 2
+        # 按名字排序，"备注好友一" 应在前
+        assert friends[0].display_name == "备注好友一"
+        assert friends[1].display_name == "好友二"
+
+    def test_list_groups(self, mock_decrypted_dir):
+        """测试群聊列表。"""
+        reader = DbReader(mock_decrypted_dir)
+        groups = reader.list_contacts(contact_type="groups")
+        assert len(groups) == 1
+        assert groups[0].username == "group1@chatroom"
+        assert groups[0].is_group
+
+    def test_list_recent(self, mock_decrypted_dir):
+        """测试最近会话（按时间倒序）。"""
+        reader = DbReader(mock_decrypted_dir)
+        recent = reader.list_contacts(contact_type="recent")
+        assert len(recent) == 3
+        # group1 最后消息时间最晚
+        assert recent[0].username == "group1@chatroom"
+        assert recent[1].username == "wxid_friend1"
+        assert recent[2].username == "wxid_friend2"
+
+    def test_self_wxid_filter(self, mock_decrypted_dir):
+        """测试过滤自己。"""
+        reader = DbReader(mock_decrypted_dir)
+        friends = reader.list_contacts(contact_type="friends", self_wxid="wxid_self")
+        usernames = [c.username for c in friends]
+        assert "wxid_self" not in usernames
+
+    def test_list_messages(self, mock_decrypted_dir):
+        """测试消息列表。"""
+        reader = DbReader(mock_decrypted_dir)
+        messages = reader.list_messages("wxid_friend1", self_wxid="wxid_self")
+        assert len(messages) == 3
+
+        # 第一条：对方发的文本
+        assert messages[0].content == "你好，价格多少？"
+        assert not messages[0].is_self
+        assert messages[0].sender_wxid == "wxid_friend1"
+
+        # 第二条：自己发的
+        assert messages[1].content == "100美元一个"
+        assert messages[1].is_self
+        assert messages[1].sender_wxid == "wxid_self"
+
+        # 第三条：语音
+        assert messages[2].is_voice
+        assert not messages[2].is_self
+
+    def test_message_time_filter(self, mock_decrypted_dir):
+        """测试时间范围过滤。"""
+        reader = DbReader(mock_decrypted_dir)
+        # 只取 1700000010 之后的
+        messages = reader.list_messages(
+            "wxid_friend1", self_wxid="wxid_self",
+            start_ts=1700000010, end_ts=1700000020,
+        )
+        assert len(messages) == 2  # 1700000010 和 1700000020
+
+    def test_message_limit(self, mock_decrypted_dir):
+        """测试 limit。"""
+        reader = DbReader(mock_decrypted_dir)
+        messages = reader.list_messages("wxid_friend1", limit=2)
+        assert len(messages) == 2
+
+    def test_get_voice_data(self, mock_decrypted_dir):
+        """测试获取语音数据。"""
+        reader = DbReader(mock_decrypted_dir)
+        voice_data = reader.get_voice_data("wxid_friend1", 3)
+        assert voice_data is not None
+        # 首字节 0x02 应被剥离
+        assert voice_data == b"\x00" * 100
+
+    def test_get_voice_data_not_found(self, mock_decrypted_dir):
+        """测试语音数据不存在。"""
+        reader = DbReader(mock_decrypted_dir)
+        voice_data = reader.get_voice_data("wxid_friend1", 999)
+        assert voice_data is None
+
+    def test_search_messages(self, mock_decrypted_dir):
+        """测试消息搜索。"""
+        reader = DbReader(mock_decrypted_dir)
+        results = reader.search_messages("价格")
+        assert len(results) == 1
+        assert "价格" in results[0].content
+
+    def test_group_message_prefix_strip(self, mock_decrypted_dir):
+        """测试群消息前缀剥离。"""
+        reader = DbReader(mock_decrypted_dir)
+        # session.db 中 group1 的 summary 有前缀 "wxid_friend1:\n大家在吗"
+        contacts = reader.list_contacts(contact_type="groups")
+        assert contacts[0].last_msg_summary == "大家在吗"
+
+
+# ============================================================================
+# 配置测试
+# ============================================================================
+class TestConfig:
+    def test_default_config(self, monkeypatch, tmp_path):
+        """测试默认配置。"""
+        from backend import config as cfg_module
+        monkeypatch.setattr(cfg_module.Path, "home", lambda: tmp_path)
+
+        cfg = cfg_module.default_config()
+        assert "decrypted_dir" in cfg
+        assert "whisper" in cfg
+        assert "llm_providers" in cfg
+
+    def test_save_load_config(self, monkeypatch, tmp_path):
+        """测试保存和加载配置。"""
+        from backend import config as cfg_module
+        monkeypatch.setattr(cfg_module.Path, "home", lambda: tmp_path)
+
+        cfg_module.save_config({"decrypted_dir": "/test/path", "self_wxid": "wxid_test"})
+        loaded = cfg_module.load_config()
+        assert loaded["decrypted_dir"] == "/test/path"
+        assert loaded["self_wxid"] == "wxid_test"
+
+
+# ============================================================================
+# LLM 测试（不实际调用 API）
+# ============================================================================
+class TestLLM:
+    def test_llm_client_not_available(self):
+        """测试未配置的 LLM 不可用。"""
+        from backend.llm import LLMClient
+        client = LLMClient({})
+        assert not client.available
+
+    def test_llm_client_available(self):
+        from backend.llm import LLMClient
+        client = LLMClient({
+            "name": "test",
+            "api_base": "https://api.test.com/v1",
+            "api_key": "sk-test",
+            "model": "gpt-4",
+        })
+        assert client.available
+
+    def test_classify_intent_rules(self):
+        """测试规则意图识别。"""
+        from backend.llm import classify_intent_rules
+        intent, conf = classify_intent_rules("你好，价格多少？")
+        assert intent in ("greeting", "quote", "other")
+        assert 0 <= conf <= 1
+
+    def test_classify_intent_rules_spanish(self):
+        """测试西班牙语关键词。"""
+        from backend.llm import classify_intent_rules
+        intent, conf = classify_intent_rules("Hola, ¿cuál es el precio?")
+        assert intent in ("greeting", "quote", "other")
+
+    def test_get_active_llm_none(self):
+        """测试无激活 LLM。"""
+        from backend.llm import get_active_llm
+        llm = get_active_llm({"active_llm": "", "llm_providers": []})
+        assert llm is None
+
+    def test_get_active_llm_by_name(self):
+        from backend.llm import get_active_llm
+        llm = get_active_llm({
+            "active_llm": "openai",
+            "llm_providers": [
+                {"name": "openai", "api_base": "https://api.openai.com/v1", "api_key": "sk-test", "model": "gpt-4"},
+            ],
+        })
+        assert llm is not None
+        assert llm.name == "openai"
+
+
+# ============================================================================
+# API 端点测试
+# ============================================================================
+class TestAPI:
+    @pytest.fixture
+    def client(self, mock_decrypted_dir, monkeypatch, tmp_path):
+        """创建测试客户端，配置指向模拟目录。"""
+        from backend import config as cfg_module
+        monkeypatch.setattr(cfg_module.Path, "home", lambda: tmp_path)
+        cfg_module.save_config({
+            "decrypted_dir": mock_decrypted_dir,
+            "self_wxid": "wxid_self",
+        })
+
+        from backend.main import app
+        from fastapi.testclient import TestClient
+        return TestClient(app)
+
+    def test_health(self, client):
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+
+    def test_get_config(self, client):
+        resp = client.get("/api/config")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "decrypted_dir" in data
+
+    def test_list_friends(self, client):
+        resp = client.get("/api/contacts", params={"type": "friends", "sort": "name"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 2
+
+    def test_list_groups(self, client):
+        resp = client.get("/api/contacts", params={"type": "groups"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+
+    def test_list_recent(self, client):
+        resp = client.get("/api/contacts", params={"type": "recent"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 3
+        assert data["contacts"][0]["username"] == "group1@chatroom"
+
+    def test_get_messages(self, client):
+        resp = client.get("/api/messages/wxid_friend1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 3
+        # 第一条是对方发的
+        assert not data["messages"][0]["is_self"]
+        # 第二条是自己发的
+        assert data["messages"][1]["is_self"]
+
+    def test_search(self, client):
+        resp = client.get("/api/search", params={"keyword": "价格"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+
+    def test_analyze_intent_rules_fallback(self, client):
+        """测试意图识别（无 LLM 时走规则兜底）。"""
+        resp = client.post("/api/analyze/intent/wxid_friend1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "intent" in data
+        assert "confidence" in data
+
+    def test_analyze_todos_no_llm(self, client):
+        """测试待办提取（无 LLM 时返回空）。"""
+        resp = client.post("/api/analyze/todos/wxid_friend1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "todos" in data
+
+    def test_analyze_summary_no_llm(self, client):
+        """测试会话总结（无 LLM 时返回提示）。"""
+        resp = client.post("/api/analyze/summary/wxid_friend1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "summary" in data

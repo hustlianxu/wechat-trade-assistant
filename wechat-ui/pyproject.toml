@@ -1,0 +1,12 @@
+[project]
+name = "wechat-ui"
+version = "0.1.0"
+description = "仿微信PC端 Web UI - 基于 wechat-decrypt 解密后的数据"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

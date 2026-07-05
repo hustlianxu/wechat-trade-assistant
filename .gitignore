@@ -14,11 +14,15 @@ env/
 node_modules/
 ui/dist/
 ui/out/
+wechat-ui/frontend/dist/
 release/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# wechat-ui 参考仓库（仅本地分析用，不入库）
+wechat-decrypt-ref/
 
 # 本地数据（绝不入库）
 data/local.db

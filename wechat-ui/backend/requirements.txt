@@ -1,0 +1,9 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+pydantic>=2.0.0
+zstandard>=0.20.0
+# 可选：SILK → WAV 转换库（pip 装 pysilk-mod 或系统装 silk_v3_decoder / ffmpeg）
+# pysilk-mod>=0.0.1
+# 测试依赖
+pytest>=7.0.0
+httpx>=0.24.0
