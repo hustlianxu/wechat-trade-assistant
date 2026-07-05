@@ -2,6 +2,7 @@
 
 import type {
   AppConfig,
+  AutoSetupResult,
   ContactListResponse,
   ContactType,
   HealthStatus,
@@ -74,6 +75,19 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(config),
     }),
+
+  // ------------------------------------------------------------------------
+  // 自动检测与自动解密
+  // ------------------------------------------------------------------------
+  /** 触发自动检测配置（傻瓜式：自动找微信目录、自动解密、自动填 wxid）。 */
+  autoSetup: (force = false) =>
+    request<AutoSetupResult>(`/api/auto-setup${qs({ force })}`, { method: 'POST' }),
+
+  /** 查询自动检测状态（不修改配置）。 */
+  autoSetupStatus: () =>
+    request<{ has_decrypted_dir: boolean; decrypted_dir_preview: string }>(
+      '/api/auto-setup/status',
+    ),
 
   // ------------------------------------------------------------------------
   // 联系人

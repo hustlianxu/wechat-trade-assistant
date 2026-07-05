@@ -172,3 +172,16 @@ export interface HealthStatus {
   whisper_configured: boolean
   llm_configured: boolean
 }
+
+// ============================================================================
+// 自动检测与自动解密
+// ============================================================================
+export interface AutoSetupResult {
+  decrypted_dir: string
+  wechat_base_dir: string
+  self_wxid: string
+  whisper: WhisperConfig
+  auto_setup_status: 'ok' | 'partial' | 'failed'
+  messages: string[]
+  needs_manual_action: string | null
+}

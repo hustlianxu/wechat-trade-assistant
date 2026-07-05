@@ -30,6 +30,7 @@ try:
         classify_intent, extract_todos, summarize_conversation,
         classify_intent_rules,
     )
+    from .auto_setup import run_auto_setup, auto_detect_decrypted_dir
 except ImportError:
     from config import load_config, save_config, update_config, default_config
     from db_reader import DbReader, Contact, Message, split_msg_type, msg_type_name
@@ -39,6 +40,57 @@ except ImportError:
         classify_intent, extract_todos, summarize_conversation,
         classify_intent_rules,
     )
+    from auto_setup import run_auto_setup, auto_detect_decrypted_dir
+
+
+# ============================================================================
+# 启动时自动检测配置（傻瓜式）
+# ============================================================================
+def _ensure_config_on_startup():
+    """启动时检查配置，若不完整则自动检测并补全。
+
+    只在 decrypted_dir 缺失或路径无效时触发，避免覆盖用户手动配置。
+    """
+    cfg = load_config()
+    decrypted_dir = cfg.get("decrypted_dir", "")
+    needs_setup = (
+        not decrypted_dir
+        or not Path(decrypted_dir).exists()
+        or not cfg.get("self_wxid", "")
+    )
+    if not needs_setup:
+        return
+
+    print("[startup] 配置不完整，开始自动检测...", file=__import__("sys").stderr)
+    try:
+        result = run_auto_setup()
+        updates = {}
+        if result.get("decrypted_dir") and (
+            not decrypted_dir or not Path(decrypted_dir).exists()
+        ):
+            updates["decrypted_dir"] = result["decrypted_dir"]
+        if result.get("wechat_base_dir") and not cfg.get("wechat_base_dir"):
+            updates["wechat_base_dir"] = result["wechat_base_dir"]
+        if result.get("self_wxid") and not cfg.get("self_wxid"):
+            updates["self_wxid"] = result["self_wxid"]
+        if result.get("whisper") and not cfg.get("whisper", {}).get("binary_path"):
+            updates["whisper"] = result["whisper"]
+
+        if updates:
+            update_config(updates)
+            print(f"[startup] 自动配置完成：{list(updates.keys())}", file=__import__("sys").stderr)
+            for msg in result.get("messages", []):
+                print(f"[startup]   {msg}", file=__import__("sys").stderr)
+            if result.get("needs_manual_action"):
+                print(f"[startup] ⚠ 需手动操作：\n{result['needs_manual_action']}", file=__import__("sys").stderr)
+        else:
+            print("[startup] 自动检测未找到可用配置，请在设置页手动填写", file=__import__("sys").stderr)
+    except Exception as e:
+        print(f"[startup] 自动配置失败：{e}", file=__import__("sys").stderr)
+
+
+# 模块加载时执行自动检测
+_ensure_config_on_startup()
 
 
 app = FastAPI(title="WeChat UI Backend", version="1.0.0")
@@ -58,12 +110,39 @@ _reader_dir: str = ""
 
 
 def get_reader() -> DbReader:
-    """获取 DbReader 实例（配置变更时自动重建）。"""
+    """获取 DbReader 实例（配置变更时自动重建）。
+
+    若 decrypted_dir 缺失或无效，会自动触发一次 auto_setup 尝试补全；
+    仍失败则抛出 400，并附上明确的引导信息。
+    """
     global _reader, _reader_dir
     cfg = load_config()
     decrypted_dir = cfg.get("decrypted_dir", "")
+
+    # 自动补救：若路径无效，触发一次 auto_setup
+    if not decrypted_dir or not Path(decrypted_dir).exists():
+        try:
+            result = run_auto_setup()
+            if result.get("decrypted_dir"):
+                update_config({"decrypted_dir": result["decrypted_dir"]})
+                if result.get("self_wxid") and not cfg.get("self_wxid"):
+                    update_config({"self_wxid": result["self_wxid"]})
+                decrypted_dir = result["decrypted_dir"]
+        except Exception:
+            pass
+
     if not decrypted_dir:
-        raise HTTPException(400, "未配置解密目录，请在设置页填写 wechat-decrypt 的 decrypted/ 路径")
+        raise HTTPException(
+            400,
+            "未检测到解密目录。请确认已用 wechat-decrypt 完成解密，"
+            "或在前端「设置」页点击「自动检测」按钮。"
+        )
+    if not Path(decrypted_dir).exists():
+        raise HTTPException(
+            400,
+            f"解密目录不存在：{decrypted_dir}。请重新运行 wechat-decrypt 解密，"
+            "或在前端「设置」页点击「自动检测」重新配置。"
+        )
     if _reader is None or _reader_dir != decrypted_dir:
         _reader = DbReader(decrypted_dir)
         _reader_dir = decrypted_dir
@@ -112,6 +191,53 @@ def set_config(req: ConfigUpdate):
         _reader = None
         _reader_dir = ""
     return update_config(updates)
+
+
+# ============================================================================
+# 自动检测与自动解密（傻瓜式配置）
+# ============================================================================
+@app.post("/api/auto-setup")
+def trigger_auto_setup(force: bool = False):
+    """手动触发自动检测配置。
+
+    流程：
+    1. 检测已存在的 decrypted 目录
+    2. 若不存在，尝试调用 wechat-decrypt 增量解密
+    3. 自动检测微信数据目录、self_wxid、whisper.cpp
+    4. 把检测到的配置写回 config.json
+    """
+    result = run_auto_setup(force=force)
+
+    # 写回配置（只更新非空字段，不覆盖用户已填的 LLM 配置）
+    updates = {}
+    if result.get("decrypted_dir"):
+        updates["decrypted_dir"] = result["decrypted_dir"]
+    if result.get("wechat_base_dir"):
+        updates["wechat_base_dir"] = result["wechat_base_dir"]
+    if result.get("self_wxid"):
+        updates["self_wxid"] = result["self_wxid"]
+    if result.get("whisper"):
+        updates["whisper"] = result["whisper"]
+
+    if updates:
+        update_config(updates)
+        # 重置 reader 缓存
+        global _reader, _reader_dir
+        if "decrypted_dir" in updates:
+            _reader = None
+            _reader_dir = ""
+
+    return result
+
+
+@app.get("/api/auto-setup/status")
+def auto_setup_status():
+    """返回当前自动检测状态（不修改配置）。"""
+    decrypted_dir = auto_detect_decrypted_dir()
+    return {
+        "has_decrypted_dir": decrypted_dir is not None,
+        "decrypted_dir_preview": decrypted_dir or "",
+    }
 
 
 # ============================================================================

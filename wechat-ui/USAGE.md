@@ -129,74 +129,102 @@
 
 ## 四、快速开始
 
-### 步骤 1：用 wechat-decrypt 完成解密
+本项目**全自动检测配置**，无需手动填写路径。前提是已用 wechat-decrypt 完成至少一次解密（产出 `decrypted/` 目录或 `all_keys.json`）。
 
-按 wechat-decrypt 项目说明，解密微信数据库，得到 `decrypted/` 目录，结构通常为：
+### 步骤 1：（一次性）安装 wechat-decrypt 并完成首次解密
 
+如果还没有解密过微信数据，需要先按 wechat-decrypt 项目说明完成首次解密。**macOS 上首次解密需要以下步骤**（之后增量解密会自动完成）：
+
+```bash
+# 1. 克隆 wechat-decrypt
+git clone https://github.com/xMduo/wechat-decrypt.git
+cd wechat-decrypt
+pip install -r requirements.txt
+
+# 2. 退出微信并重签名（一次性，仅 macOS 需要）
+killall WeChat
+sudo codesign --force --deep --sign - /Applications/WeChat.app
+
+# 3. 启动微信并登录
+
+# 4. 编译并运行密钥提取器（仅 macOS 需要，Windows 用 python find_all_keys.py）
+cc -O2 -o find_all_keys_macos find_all_keys_macos.c -framework Foundation
+sudo ./find_all_keys_macos
+# 产出 all_keys.json
+
+# 5. 解密所有数据库（产出 decrypted/ 目录）
+python decrypt_db.py
 ```
-decrypted/
-├── contact/
-│   └── contact.db              # 联系人
-├── session/
-│   └── session.db              # 会话列表
-├── message/
-│   ├── message_0.db            # 消息分片 0
-│   ├── message_1.db            # 消息分片 1
-│   ├── media_0.db              # 语音数据
-│   └── message_resource.db     # 图片资源索引
-└── ...
-```
 
-> 3.x 版微信文件名可能为大写（`Message/msg_0.db`、`Contact/wccontact_new2.db`），本项目自动兼容。
+> 完成后，`all_keys.json` 和 `decrypted/` 会保留下来，**之后本项目会自动增量解密**，无需重复上述步骤。
 
-### 步骤 2：安装后端依赖
+### 步骤 2：安装本项目依赖
 
 ```bash
 cd wechat-ui
 pip install -r backend/requirements.txt
+
+cd frontend
+npm install
 ```
 
-### 步骤 3：启动后端
+### 步骤 3：启动后端（自动检测配置）
 
 ```bash
-# 方式 A：作为模块启动（推荐，从 wechat-ui 根目录）
 cd wechat-ui
 python -m backend.main
-
-# 方式 B：直接运行脚本
-cd wechat-ui/backend
-python main.py
-
-# 方式 C：用 uvicorn 启动（支持热重载）
-cd wechat-ui
-uvicorn backend.main:app --host 0.0.0.0 --port 8766 --reload
 ```
 
-启动后访问 [http://localhost:8766/api/health](http://localhost:8766/api/health)，应返回：
+**后端启动时会自动执行**：
+1. 检查 `~/.wta_ui/config.json` 配置是否完整
+2. 若不完整，自动扫描以下位置找已解密目录：
+   - wechat-decrypt 的 `config.json` 中的 `decrypted_dir`
+   - wechat-decrypt 项目目录下的 `decrypted/`
+   - wechat-ui 同级目录、`~/.wta_ui/decrypted/`、`/tmp/wechat_decrypted/`
+3. 若找不到已解密目录但 `all_keys.json` 存在，**自动调用 `decrypt_db.py -i` 增量解密**
+4. 自动检测微信数据目录（macOS/Windows/Linux 标准路径）
+5. 自动推断本人 wxid（从数据目录名或消息表统计）
+6. 自动检测 whisper.cpp（PATH / Homebrew / 项目本地）
+7. 自动写回 `~/.wta_ui/config.json`
 
-```json
-{"ok": true, "ts": 1783262287, "decrypted_dir": "", "self_wxid": "", ...}
+启动日志会打印检测过程，例如：
+```
+[startup] 配置不完整，开始自动检测...
+[startup] 自动配置完成：['decrypted_dir', 'wechat_base_dir', 'self_wxid']
+[startup]   ✓ 检测到已解密目录：/path/to/decrypted
+[startup]   ✓ 检测到微信数据目录：/path/to/xwechat_files/wxid_xxx
+[startup]   ✓ 检测到本人 wxid：wxid_xxx
 ```
 
-### 步骤 4：安装前端依赖并启动
+### 步骤 4：启动前端
 
 ```bash
 cd wechat-ui/frontend
-npm install
 npm run dev
 ```
 
-启动后访问 [http://localhost:5173](http://localhost:5173)。
+启动后访问 [http://localhost:5173](http://localhost:5173)，应直接看到联系人列表。
 
 > Vite 开发服务器已配置代理：`/api/*` → `http://localhost:8766`，无需处理跨域。
 
-### 步骤 5：首次配置
+### 步骤 5：（可选）手动触发自动检测
 
-1. 在浏览器打开前端后，左上角点击「设置」
-2. 填写：
-   - **解密目录**：`decrypted/` 的绝对路径
-   - **本人 wxid**：你的微信 wxid（可从 `decrypted/` 子目录名或 contact.db 中找到）
-3. 保存后即可在左侧看到联系人/群聊列表
+如果自动检测未成功，或想重新检测：
+
+1. 前端左上角点击「设置」
+2. 在「数据目录」分组右上角点击 **「🔍 自动检测」** 按钮
+3. 查看检测结果卡片，会列出每一步的检测信息
+4. 若提示需要手动操作（如 macOS 需先运行密钥提取器），按提示完成即可
+
+也可以通过 API 手动触发：
+
+```bash
+# 查询当前检测状态
+curl http://localhost:8766/api/auto-setup/status
+
+# 强制重新检测并写回配置
+curl -X POST "http://localhost:8766/api/auto-setup?force=true"
+```
 
 ### 步骤 6：（可选）构建生产版本
 
@@ -207,6 +235,20 @@ npm run preview    # 本地预览构建产物
 ```
 
 构建后可用任意静态服务器托管 `dist/`，只需把 `/api` 反代到 8766 即可。
+
+### 自动检测的覆盖范围
+
+| 检测项 | 检测来源 | 是否需要手动 |
+|--------|----------|-------------|
+| wechat-decrypt 项目目录 | 环境变量 `WECHAT_DECRYPT_DIR` / 同级目录 / `~/wechat-decrypt` | 否 |
+| 已解密目录 `decrypted/` | wechat-decrypt config / 项目目录 / 常见路径 | 否 |
+| 自动增量解密 | 调用 `decrypt_db.py -i`（需 `all_keys.json` 存在） | 仅首次需手动提取密钥 |
+| 微信数据目录 | wechat-decrypt `auto_detect_db_dir` + 标准路径扫描 | 否 |
+| 本人 wxid | 数据目录名 / 消息表发送频次统计 | 否 |
+| whisper.cpp | PATH / Homebrew / 项目本地 bin | 否（可选依赖） |
+| LLM 配置 | 需用户在设置页填写 API Key | 是（仅 LLM 功能必需） |
+
+> **只有 LLM API Key 需要用户手动填写**，其余全部自动。如果只浏览消息和本地语音转录，连 LLM 也不需要。
 
 ---
 
@@ -483,6 +525,27 @@ GET /api/config          # 读取配置
 POST /api/config         # 更新配置（部分字段，body 为 JSON）
 ```
 
+### 自动检测与自动解密
+
+```
+GET  /api/auto-setup/status        # 查询检测状态（不修改配置）
+POST /api/auto-setup?force=false   # 触发自动检测并写回配置
+```
+
+`POST /api/auto-setup` 返回：
+
+```json
+{
+  "decrypted_dir": "/path/to/decrypted",
+  "wechat_base_dir": "/path/to/xwechat_files/wxid_xxx",
+  "self_wxid": "wxid_xxx",
+  "whisper": {"binary_path": "...", "model_path": "...", "language": ""},
+  "auto_setup_status": "ok",          // ok | partial | failed
+  "messages": ["✓ 检测到已解密目录：...", ...],
+  "needs_manual_action": null          // 非空时为需要手动操作的提示
+}
+```
+
 ### 联系人
 
 ```
@@ -535,7 +598,7 @@ python -m pytest tests/ -v
 预期输出：
 
 ```
-========================= 33 passed in 1s =========================
+========================= 43 passed in 1s =========================
 ```
 
 测试覆盖：
@@ -546,7 +609,8 @@ python -m pytest tests/ -v
 | `TestDbReader` | 12 | 初始化、好友/群/最近列表、消息列表、时间过滤、分页、语音数据、搜索、群消息前缀剥离 |
 | `TestConfig` | 2 | 默认配置、保存加载 |
 | `TestLLM` | 6 | 客户端可用性、规则意图识别（中西英）、激活 LLM 切换 |
-| `TestAPI` | 10 | 全部 API 端点（用 FastAPI TestClient） |
+| `TestAPI` | 12 | 全部 API 端点（含 `/api/auto-setup`、`/api/auto-setup/status`） |
+| `TestAutoSetup` | 8 | 解密目录校验、wxid 格式判断、本人 wxid 推断、whisper 检测、解密输出解析、run_auto_setup 全流程 |
 
 ### 前端类型检查与构建
 
@@ -632,15 +696,29 @@ curl http://localhost:8766/api/config
 
 ## 十二、常见问题
 
-### Q1：左侧列表为空？
+### Q1：左侧列表为空 / 报错「解密目录不存在」？
 
-- 检查「设置」中的 `decrypted_dir` 路径是否正确
-- 确认 `decrypted/` 下有 `contact/contact.db` 和 `session/session.db`
-- 查看 `/api/health` 返回的 `decrypted_dir` 是否非空
+本项目**全自动检测**，正常情况无需手动配置。若报错：
+
+1. **先点「设置 → 🔍 自动检测」按钮**，让程序重新扫描
+2. 查看检测结果卡片，若提示「未找到已解密目录」，说明还没用 wechat-decrypt 解密过
+3. 按「快速开始 → 步骤 1」完成首次解密（产出 `decrypted/` 或 `all_keys.json`）
+4. 若提示「未找到密钥文件 all_keys.json」且在 macOS，需先运行密钥提取器：
+   ```bash
+   killall WeChat
+   sudo codesign --force --deep --sign - /Applications/WeChat.app
+   # 启动微信登录
+   cd <wechat-decrypt 目录>
+   cc -O2 -o find_all_keys_macos find_all_keys_macos.c -framework Foundation
+   sudo ./find_all_keys_macos
+   ```
+5. 完成后回来重试自动检测，程序会自动调 `decrypt_db.py -i` 增量解密
+
+也可通过环境变量指定 wechat-decrypt 位置：`export WECHAT_DECRYPT_DIR=/path/to/wechat-decrypt`
 
 ### Q2：消息不显示 / 显示不全？
 
-- 确认 `self_wxid` 填写正确，否则无法区分本人/对方
+- `self_wxid` 由程序自动从数据目录名或消息表发送频次推断，若不准可在设置页手动改
 - 消息可能分散在多个 `message_N.db` 分片，本项目会自动遍历
 - 3.x 版微信文件名大写，本项目已自动兼容大小写
 
@@ -717,10 +795,11 @@ server {
 wechat-ui/
 ├── backend/
 │   ├── config.py          # 配置管理（~/.wta_ui/config.json）
+│   ├── auto_setup.py      # 自动检测微信目录、自动解密、自动推断 wxid/whisper
 │   ├── db_reader.py       # 解密数据库读取器（核心）
 │   ├── voice.py           # SILK → WAV → whisper.cpp / LLM 转录
 │   ├── llm.py             # 多 LLM、意图识别、待办、总结
-│   ├── main.py            # FastAPI 应用（端口 8766）
+│   ├── main.py            # FastAPI 应用（端口 8766，启动时自动 setup）
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
@@ -740,7 +819,7 @@ wechat-ui/
 │   ├── package.json
 │   └── vite.config.ts     # 端口 5173，/api 代理 8766
 ├── tests/
-│   └── test_backend.py    # 33 个单元测试
+│   └── test_backend.py    # 43 个单元测试（含 auto_setup 模块）
 └── pyproject.toml         # pytest 配置
 ```
 

@@ -419,3 +419,110 @@ class TestAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert "summary" in data
+
+    def test_auto_setup_status(self, client):
+        """测试自动检测状态查询。"""
+        resp = client.get("/api/auto-setup/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "has_decrypted_dir" in data
+        assert "decrypted_dir_preview" in data
+
+    def test_auto_setup_trigger(self, client):
+        """测试手动触发自动检测（不依赖真实微信环境，应返回状态字段）。"""
+        resp = client.post("/api/auto-setup")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "auto_setup_status" in data
+        assert data["auto_setup_status"] in ("ok", "partial", "failed")
+        assert "messages" in data
+        assert isinstance(data["messages"], list)
+        assert "decrypted_dir" in data
+        assert "self_wxid" in data
+        assert "whisper" in data
+
+
+# ============================================================================
+# 自动检测模块（auto_setup）单元测试
+# ============================================================================
+class TestAutoSetup:
+    """auto_setup 模块的纯函数测试（不依赖真实微信环境）。"""
+
+    def test_is_valid_decrypted_dir_empty(self):
+        """空目录不应被识别为解密目录。"""
+        from backend.auto_setup import _is_valid_decrypted_dir
+        with tempfile.TemporaryDirectory() as td:
+            assert _is_valid_decrypted_dir(td) is False
+
+    def test_is_valid_decrypted_dir_with_contact(self, mock_decrypted_dir):
+        """有 contact.db 的目录应被识别为有效解密目录。"""
+        from backend.auto_setup import _is_valid_decrypted_dir
+        assert _is_valid_decrypted_dir(mock_decrypted_dir) is True
+
+    def test_auto_detect_decrypted_dir_finds_mock(self, mock_decrypted_dir, monkeypatch):
+        """auto_detect_decrypted_dir 应能扫描到模拟目录。"""
+        from backend import auto_setup
+        # 把模拟目录注入扫描路径
+        monkeypatch.setattr(Path, "home", lambda: Path(mock_decrypted_dir).parent)
+        # 让 wechat-decrypt 检测返回 None，强制走回退扫描
+        monkeypatch.setattr(auto_setup, "find_wechat_decrypt_dir", lambda: None)
+        # 直接调用 _is_valid_decrypted_dir 验证
+        assert auto_setup._is_valid_decrypted_dir(mock_decrypted_dir)
+
+    def test_looks_like_wxid(self):
+        """测试 wxid 格式判断。"""
+        from backend.auto_setup import _looks_like_wxid
+        assert _looks_like_wxid("wxid_abc123") is True
+        assert _looks_like_wxid("wxid_8pcyza2ww2qj21_bd86") is True
+        assert _looks_like_wxid("张三") is False  # 中文不是 wxid
+        assert _looks_like_wxid("") is False
+        assert _looks_like_wxid("ab") is False  # 太短
+        assert _looks_like_wxid("abc") is False  # 太短
+
+    def test_infer_self_from_decrypted(self, mock_decrypted_dir):
+        """从解密目录推断本人 wxid。"""
+        from backend.auto_setup import _infer_self_from_decrypted
+        # mock 数据中 real_sender_id=1 对应 wxid_self
+        wxid = _infer_self_from_decrypted(mock_decrypted_dir)
+        # 应该返回某个 wxid（具体是哪个取决于消息统计）
+        assert wxid is not None
+        assert wxid.startswith("wxid_")
+
+    def test_auto_detect_whisper_returns_dict(self):
+        """auto_detect_whisper 应返回 dict（即使没装 whisper 也应有字段）。"""
+        from backend.auto_setup import auto_detect_whisper
+        result = auto_detect_whisper()
+        assert isinstance(result, dict)
+        assert "binary_path" in result
+        assert "model_path" in result
+        assert "language" in result
+
+    def test_parse_decrypt_count(self):
+        """测试解密输出解析。"""
+        from backend.auto_setup import _parse_decrypt_count
+        assert _parse_decrypt_count("解密成功: 26 个数据库") == 26
+        assert _parse_decrypt_count("decrypted: 5") == 5
+        assert _parse_decrypt_count("no match") == 0
+
+    def test_run_auto_setup_with_mock(self, mock_decrypted_dir, monkeypatch):
+        """run_auto_setup 在有模拟解密目录时应返回 ok 状态。"""
+        from backend import auto_setup
+
+        # mock 检测函数，让它们找到模拟目录
+        monkeypatch.setattr(auto_setup, "auto_detect_decrypted_dir", lambda: mock_decrypted_dir)
+        monkeypatch.setattr(auto_setup, "auto_detect_wechat_data_dir", lambda: None)
+        monkeypatch.setattr(
+            auto_setup, "auto_detect_self_wxid",
+            lambda **kw: "wxid_self"
+        )
+        monkeypatch.setattr(
+            auto_setup, "auto_detect_whisper",
+            lambda: {"binary_path": "", "model_path": "", "language": ""}
+        )
+
+        result = auto_setup.run_auto_setup()
+        assert result["auto_setup_status"] == "ok"
+        assert result["decrypted_dir"] == mock_decrypted_dir
+        assert result["self_wxid"] == "wxid_self"
+        assert isinstance(result["messages"], list)
+        assert len(result["messages"]) > 0

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { AppConfig, LLMProvider, WhisperConfig } from '../types'
+import type { AppConfig, AutoSetupResult, LLMProvider, WhisperConfig } from '../types'
 
 interface Props {
   /** 当前配置（可能为 null，此时弹窗会拉取）。 */
@@ -48,6 +48,8 @@ export default function Settings({ config, onClose, onSaved }: Props) {
   const [saving, setSaving] = useState<boolean>(false)
   const [error, setError] = useState<string>('')
   const [savedHint, setSavedHint] = useState<string>('')
+  const [autoRunning, setAutoRunning] = useState<boolean>(false)
+  const [autoResult, setAutoResult] = useState<AutoSetupResult | null>(null)
 
   // 首次打开若没有传入配置，则拉取
   useEffect(() => {
@@ -62,6 +64,10 @@ export default function Settings({ config, onClose, onSaved }: Props) {
       .getConfig()
       .then((c) => {
         if (!cancelled) setDraft(c)
+        // 若配置不完整（decrypted_dir 为空或路径无效），自动触发一次检测
+        if (!cancelled && (!c.decrypted_dir || c.self_wxid === '')) {
+          triggerAutoSetup(false)
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : '加载失败')
@@ -73,6 +79,32 @@ export default function Settings({ config, onClose, onSaved }: Props) {
       cancelled = true
     }
   }, [config])
+
+  /** 触发自动检测。 */
+  const triggerAutoSetup = async (force: boolean) => {
+    setAutoRunning(true)
+    setError('')
+    setAutoResult(null)
+    try {
+      const result = await api.autoSetup(force)
+      setAutoResult(result)
+      // 把检测到的字段合并到 draft（不覆盖用户已填的 LLM 配置）
+      setDraft((d) => ({
+        ...d,
+        decrypted_dir: result.decrypted_dir || d.decrypted_dir,
+        wechat_base_dir: result.wechat_base_dir || d.wechat_base_dir,
+        self_wxid: result.self_wxid || d.self_wxid,
+        whisper: result.whisper?.binary_path ? result.whisper : d.whisper,
+      }))
+      if (result.needs_manual_action) {
+        setError(result.needs_manual_action)
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '自动检测失败')
+    } finally {
+      setAutoRunning(false)
+    }
+  }
 
   /** 更新顶层字段。 */
   const updateField = <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => {
@@ -165,18 +197,56 @@ export default function Settings({ config, onClose, onSaved }: Props) {
             <>
               {/* 数据目录配置 */}
               <div className="settings-section">
-                <div className="settings-section__title">数据目录</div>
+                <div className="settings-section__title">
+                  数据目录
+                  <button
+                    className="btn btn--primary btn--small"
+                    style={{ marginLeft: 'auto' }}
+                    onClick={() => triggerAutoSetup(true)}
+                    disabled={autoRunning}
+                    title="自动检测微信数据目录、自动解密、自动填 wxid"
+                  >
+                    {autoRunning ? '检测中…' : '🔍 自动检测'}
+                  </button>
+                </div>
+
+                {/* 自动检测结果 */}
+                {autoResult && (
+                  <div className="auto-setup-result">
+                    {autoResult.messages.map((msg, i) => (
+                      <div key={i} className="auto-setup-result__line">
+                        {msg}
+                      </div>
+                    ))}
+                    {autoResult.auto_setup_status === 'ok' && (
+                      <div className="auto-setup-result__status auto-setup-result__status--ok">
+                        ✓ 配置完整，可正常使用
+                      </div>
+                    )}
+                    {autoResult.auto_setup_status === 'partial' && (
+                      <div className="auto-setup-result__status auto-setup-result__status--warn">
+                        ⚠ 部分配置缺失，可手动补充下方字段
+                      </div>
+                    )}
+                    {autoResult.auto_setup_status === 'failed' && (
+                      <div className="auto-setup-result__status auto-setup-result__status--error">
+                        ✗ 自动检测失败，请参考下方提示或手动填写
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <div className="settings-field">
                   <label className="settings-field__label">解密目录路径</label>
                   <input
                     type="text"
                     className="settings-field__input"
-                    placeholder="wechat-decrypt 解密后的 decrypted/ 路径"
+                    placeholder="自动检测，或手动填写 wechat-decrypt 解密后的 decrypted/ 路径"
                     value={draft.decrypted_dir}
                     onChange={(e) => updateField('decrypted_dir', e.target.value)}
                   />
                   <div className="settings-field__hint">
-                    wechat-decrypt 解密后的目录，包含 contact/、session/、message/ 等子目录
+                    wechat-decrypt 解密后的目录，包含 contact/、session/、message/ 等子目录。点击「自动检测」可自动查找。
                   </div>
                 </div>
                 <div className="settings-field">

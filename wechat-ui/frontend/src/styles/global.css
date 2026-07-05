@@ -914,6 +914,38 @@ input:focus, textarea:focus, select:focus {
   margin-bottom: 10px;
   padding-bottom: 6px;
   border-bottom: 1px solid var(--border-light);
+  display: flex;
+  align-items: center;
+}
+
+/* 自动检测结果 */
+.auto-setup-result {
+  background: var(--bg-secondary, #f7f7f7);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.auto-setup-result__line {
+  color: var(--text-secondary, #888);
+  line-height: 1.6;
+  word-break: break-all;
+}
+.auto-setup-result__status {
+  margin-top: 8px;
+  font-weight: 600;
+  font-size: 12px;
+}
+.auto-setup-result__status--ok {
+  color: var(--color-primary, #07c160);
+}
+.auto-setup-result__status--warn {
+  color: #fa9d3b;
+}
+.auto-setup-result__status--error {
+  color: #fa5151;
 }
 .settings-field {
   margin-bottom: 12px;
