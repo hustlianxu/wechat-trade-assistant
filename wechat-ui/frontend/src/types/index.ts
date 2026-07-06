@@ -185,3 +185,34 @@ export interface AutoSetupResult {
   messages: string[]
   needs_manual_action: string | null
 }
+
+// ============================================================================
+// LLM 连通性测试结果（对应后端 POST /api/llm/test）
+// ============================================================================
+export interface LLMTestResult {
+  ok: boolean
+  /** 识别出的 provider 主机名（成功时）。 */
+  provider: string
+  model: string
+  /** 清理后的 api_base。 */
+  api_base: string
+  /** LLM 的响应文本（成功时）。 */
+  response: string
+  /** 失败时的诊断信息。 */
+  error: string
+  /** 配置问题提示（如缺 /v1 后缀）。 */
+  config_hint: string
+}
+
+// ============================================================================
+// 增量解密结果（对应后端 POST /api/decrypt/incremental）
+// ============================================================================
+export interface IncrementalDecryptResult {
+  ok: boolean
+  /** 解密后的目录路径。 */
+  decrypted_dir: string
+  /** 本次解密的数据库数量。 */
+  decrypted_count: number
+  /** 提示信息（成功/失败原因）。 */
+  message: string
+}

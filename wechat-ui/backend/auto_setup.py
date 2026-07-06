@@ -77,6 +77,17 @@ def _wechat_decrypt_dir_candidates() -> list[Path]:
         if (p / "decrypt_db.py").exists():
             candidates.append(p)
 
+    # 5. 常见开发目录：~/Study/、~/Projects/、~/code/ 等
+    for dev_name in ("Study", "Projects", "code", "workspace", "work", "dev",
+                     "repos", "src", "github", "Code"):
+        dev_dir = home / dev_name
+        if not dev_dir.is_dir():
+            continue
+        for sub in ("wechat-decrypt", "wechat-decrypt-ref", "wechat_decrypt"):
+            p = dev_dir / sub
+            if (p / "decrypt_db.py").exists():
+                candidates.append(p)
+
     # 去重
     seen = set()
     result = []
@@ -314,6 +325,68 @@ def _infer_self_from_decrypted(decrypted_dir: str) -> Optional[str]:
 # ============================================================================
 # 自动检测已存在的 decrypted 目录
 # ============================================================================
+# 常见开发目录：用户常把 wechat-decrypt 克隆在这些目录下，解密结果也在其中
+_DEV_DIR_NAMES = ("Study", "Projects", "code", "workspace", "work", "dev",
+                  "repos", "src", "github", "Code")
+
+# wechat-decrypt 可能的目录名（解密结果常在其下的 decrypted/ 子目录）
+_WCD_DIR_NAMES = ("wechat-decrypt", "wechat-decrypt-ref", "wechat_decrypt")
+
+
+def _dev_dir_candidates() -> list[Path]:
+    """返回需要扫描的开发目录候选列表（家目录下 + 常见绝对路径）。
+
+    覆盖 ~/Study/、~/Projects/、~/code/ 等开发者常放代码的位置。
+    """
+    candidates: list[Path] = []
+    home = Path.home()
+
+    # 1. 家目录下的常见开发目录
+    for name in _DEV_DIR_NAMES:
+        p = home / name
+        if p.is_dir():
+            candidates.append(p)
+
+    # 2. 家目录本身（用户可能直接把 wechat-decrypt 放在 ~ 下）
+    candidates.append(home)
+
+    # 3. 常见绝对路径（macOS / Linux）
+    for abs_path in ("/opt", "/srv"):
+        p = Path(abs_path)
+        if p.is_dir():
+            candidates.append(p)
+
+    return candidates
+
+
+def _scan_dev_dirs_for_decrypted() -> Optional[str]:
+    """扫描开发目录下的 wechat-decrypt 项目及其 decrypted/ 子目录。
+
+    查找模式：
+    - ~/Study/wechat-decrypt/decrypted
+    - ~/Projects/wechat-decrypt/decrypted
+    - ~/code/wechat-decrypt/decrypted
+    - 以及 wechat-decrypt-ref 等变体
+    - 也直接查找 ~/Study/decrypted 等直接放在开发目录下的情况
+    """
+    for dev_dir in _dev_dir_candidates():
+        # 1. dev_dir/<wcd_name>/decrypted
+        for wcd_name in _WCD_DIR_NAMES:
+            p = dev_dir / wcd_name / "decrypted"
+            if _is_valid_decrypted_dir(p):
+                return str(p)
+        # 2. dev_dir/decrypted（直接放在开发目录下）
+        p = dev_dir / "decrypted"
+        if _is_valid_decrypted_dir(p):
+            return str(p)
+        # 3. dev_dir/wechat-decrypt/<wcd_name>/decrypted（嵌套一层）
+        for wcd_name in _WCD_DIR_NAMES:
+            nested = dev_dir / "wechat-decrypt" / wcd_name / "decrypted"
+            if _is_valid_decrypted_dir(nested):
+                return str(nested)
+    return None
+
+
 def auto_detect_decrypted_dir() -> Optional[str]:
     """自动检测已存在的解密目录。
 
@@ -321,8 +394,9 @@ def auto_detect_decrypted_dir() -> Optional[str]:
     1. wechat-decrypt 的 config.json 中 decrypted_dir（已展开绝对路径）
     2. wechat-decrypt 项目目录下的 decrypted/
     3. wechat-ui 同级目录下的 decrypted/
-    4. ~/.wta_ui/decrypted/
-    5. /tmp/wechat_decrypted/（mcp_server 缓存）
+    4. 开发目录扫描：~/Study/、~/Projects/、~/code/ 等下的 wechat-decrypt/decrypted
+    5. ~/.wta_ui/decrypted/
+    6. /tmp/wechat_decrypted/（mcp_server 缓存）
     """
     # 1. wechat-decrypt config.json
     wcd_cfg = load_wcd_config()
@@ -346,12 +420,17 @@ def auto_detect_decrypted_dir() -> Optional[str]:
         if _is_valid_decrypted_dir(p):
             return str(p)
 
-    # 4. ~/.wta_ui/decrypted/
+    # 4. 开发目录扫描：~/Study/、~/Projects/、~/code/ 等
+    dev_hit = _scan_dev_dirs_for_decrypted()
+    if dev_hit:
+        return dev_hit
+
+    # 5. ~/.wta_ui/decrypted/
     p = Path.home() / ".wta_ui" / "decrypted"
     if _is_valid_decrypted_dir(p):
         return str(p)
 
-    # 5. 临时缓存
+    # 6. 临时缓存
     p = Path("/tmp/wechat_decrypted")
     if _is_valid_decrypted_dir(p):
         return str(p)

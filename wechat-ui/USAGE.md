@@ -20,6 +20,7 @@
 - [十、测试](#十测试)
 - [十一、数据库结构说明](#十一数据库结构说明)
 - [十二、常见问题](#十二常见问题)
+- [十三、变更日志（2026-07-07）](#十三变更日志2026-07-07)
 
 ---
 
@@ -428,6 +429,18 @@ make
 - **配置文件**：修改 `active_llm` 字段为对应 provider 的 `name`
 - 切换后立即生效，无需重启后端
 
+### 测试 LLM 连通性（新增）
+
+每个 Provider 卡片右侧有「测试连通性」按钮，**无需先保存配置**即可验证：
+
+1. 填好 `name` / `model` / `api_base` / `api_key`
+2. 点「测试连通性」
+3. 查看结果卡片：
+   - **成功**：显示绿色「✓ 连通成功」+ provider 主机名 + LLM 响应预览
+   - **失败**：显示红色「✗ 连通失败」+ 配置提示（如「api_base 可能缺少 /v1 后缀」）+ 详细错误（如 HTTP 401 未授权）
+
+> 后端会自动清理 `api_base` 中混入的反引号/引号/空格（从 Markdown 文档复制时常见），并对已知 provider（DeepSeek / OpenAI / Moonshot 等）检测 `/v1` 后缀缺失。
+
 ### 语音转录专用 LLM
 
 如需用 LLM 兜底转录语音，给 provider 添加 `whisper_model` 字段：
@@ -546,6 +559,63 @@ POST /api/auto-setup?force=false   # 触发自动检测并写回配置
 }
 ```
 
+### 增量解密（新增）
+
+```
+POST /api/decrypt/incremental      # 只拉取本地库中最新消息之后的新消息
+```
+
+复用 wechat-decrypt 的 `decrypt_db.py -i` 增量模式，**不重新解密联系人库**，速度快。
+完成后自动把新的 `decrypted_dir` 写回配置并重置 reader 缓存。
+
+返回：
+
+```json
+{
+  "ok": true,
+  "decrypted_dir": "/path/to/decrypted",
+  "decrypted_count": 5,
+  "message": "解密成功（增量模式，5 个数据库）"
+}
+```
+
+> 失败时 `ok=false`，`message` 携带原因（如「未找到 wechat-decrypt 项目目录」「未找到密钥文件 all_keys.json」）。
+
+### LLM 连通性测试（新增）
+
+```
+POST /api/llm/test                 # 测试某个 provider 的连通性（无需先保存）
+```
+
+请求 body 即一个完整的 provider 配置：
+
+```json
+{
+  "name": "deepseek",
+  "api_base": "https://api.deepseek.com/v1",
+  "api_key": "sk-xxx",
+  "model": "deepseek-chat",
+  "temperature": 0.3,
+  "max_tokens": 2000
+}
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "provider": "api.deepseek.com",
+  "model": "deepseek-chat",
+  "api_base": "https://api.deepseek.com/v1",
+  "response": "ok",
+  "error": "",
+  "config_hint": ""
+}
+```
+
+> 失败时 `ok=false`：`config_hint` 携带配置问题（如缺 `/v1`），`error` 携带调用诊断（如 HTTP 401/404/5xx）。
+
 ### 联系人
 
 ```
@@ -581,6 +651,8 @@ POST /api/analyze/summary/{username}?start_ts=&end_ts=&limit=200
 
 时间戳均为秒级 Unix 时间戳，`0` 表示不限。
 
+> 三个接口的返回都新增了 `llm_error` 字段：LLM 调用失败时携带诊断信息（如「HTTP 401 未授权」「api_base 可能缺少 /v1 后缀」），前端会直接展示，不再静默吞掉错误。
+
 ---
 
 ## 十、测试
@@ -598,7 +670,7 @@ python -m pytest tests/ -v
 预期输出：
 
 ```
-========================= 43 passed in 1s =========================
+========================= 66 passed in 1s =========================
 ```
 
 测试覆盖：
@@ -610,7 +682,9 @@ python -m pytest tests/ -v
 | `TestConfig` | 2 | 默认配置、保存加载 |
 | `TestLLM` | 6 | 客户端可用性、规则意图识别（中西英）、激活 LLM 切换 |
 | `TestAPI` | 12 | 全部 API 端点（含 `/api/auto-setup`、`/api/auto-setup/status`） |
-| `TestAutoSetup` | 8 | 解密目录校验、wxid 格式判断、本人 wxid 推断、whisper 检测、解密输出解析、run_auto_setup 全流程 |
+| `TestAutoSetup` | 10 | 解密目录校验、wxid 格式判断、本人 wxid 推断、whisper 检测、解密输出解析、run_auto_setup 全流程、**开发目录扫描（~/Study/ 等）** |
+| `TestLLMErrorHandling` | 16 | **api_base 反引号/空格清理、/v1 后缀检测、HTTP 错误诊断（401/404/500）、chat 返回 (content, error) 元组、classify_intent 透传 llm_error** |
+| `TestAPIExtra` | 5 | **`/api/llm/test` 配置校验与反引号清理、`/api/decrypt/incremental` 成功与失败路径** |
 
 ### 前端类型检查与构建
 
@@ -714,7 +788,15 @@ curl http://localhost:8766/api/config
    ```
 5. 完成后回来重试自动检测，程序会自动调 `decrypt_db.py -i` 增量解密
 
+**已解密但检测不到？** 程序现在会扫描以下位置查找 `decrypted/` 目录：
+- wechat-decrypt 的 `config.json` 中 `decrypted_dir`
+- wechat-decrypt 项目目录、wechat-ui 同级目录
+- **开发目录**：`~/Study/`、`~/Projects/`、`~/code/`、`~/workspace/` 等下的 `wechat-decrypt/decrypted`（用户常把项目克隆在这里）
+- `~/.wta_ui/decrypted/`、`/tmp/wechat_decrypted/`
+
 也可通过环境变量指定 wechat-decrypt 位置：`export WECHAT_DECRYPT_DIR=/path/to/wechat-decrypt`
+
+**只想拉取最新消息？** 点「设置 → ⬆ 增量同步」按钮，只解密本地库中最新消息之后的新消息，不重新解密联系人库，速度快。
 
 ### Q2：消息不显示 / 显示不全？
 
@@ -737,6 +819,8 @@ curl http://localhost:8766/api/config
 - 这些功能**需要配置 LLM**（待办和总结必须有 LLM，意图识别无 LLM 时走规则兜底）
 - 确认 `active_llm` 指向的 provider 名称存在且 `api_key` 有效
 - 在 `/api/health` 返回中 `llm_configured` 应为 `true`
+- **先点「测试连通性」按钮**验证配置：会自动检测 `api_base` 是否缺少 `/v1` 后缀、`api_key` 是否有效（HTTP 401）、`model` 是否存在（HTTP 404/400）
+- 分析失败时右栏会直接显示 `llm_error` 诊断信息（不再静默吞掉错误）
 
 ### Q5：如何切换 LLM？
 
@@ -819,8 +903,102 @@ wechat-ui/
 │   ├── package.json
 │   └── vite.config.ts     # 端口 5173，/api 代理 8766
 ├── tests/
-│   └── test_backend.py    # 43 个单元测试（含 auto_setup 模块）
+│   └── test_backend.py    # 66 个单元测试（含 auto_setup / LLM 错误处理 / 增量解密端点）
 └── pyproject.toml         # pytest 配置
+```
+
+---
+
+## 十三、变更日志（2026-07-07）
+
+本次更新修复了昨天到现在提出的三个问题。所有变更均已通过测试（66 个测试通过、tsc 0 错误、vite build 成功）。
+
+### 修复 1：LLM 报错无日志 → 错误透传 + 配置校验
+
+**问题**：LLM 调用失败时（如 api_key 无效、api_base 缺 `/v1`、model 名错），原代码静默返回 `None`，前端只看到「分析失败」，无法定位原因。
+
+**改动文件**：
+- [backend/llm.py](backend/llm.py)
+- [backend/main.py](backend/main.py)
+- [frontend/src/components/Settings.tsx](frontend/src/components/Settings.tsx)
+- [frontend/src/api/client.ts](frontend/src/api/client.ts)
+- [frontend/src/types/index.ts](frontend/src/types/index.ts)
+
+**具体变更**：
+1. `LLMClient.chat()` 返回类型从 `Optional[str]` 改为 `tuple[Optional[str], str]`（content, error）
+2. 新增 `_sanitize_api_base()`：自动清理 `api_base` 中混入的反引号/单双引号/空格/末尾斜杠（从 Markdown 文档复制时常见）
+3. 新增 `validate_api_base()`：对已知 provider（DeepSeek / OpenAI / Moonshot / 通义 / 智谱 / SiliconFlow）检测 `/v1` 后缀缺失
+4. 新增 `_diagnose_http_error()`：针对 401/404/400/5xx 构造可读诊断信息
+5. `classify_intent` / `extract_todos` / `summarize_conversation` 全部透传 `llm_error` 字段
+6. 三个分析端点（`/api/analyze/intent|todos|summary`）返回值新增 `llm_error` 字段
+7. 新增 `POST /api/llm/test` 端点：测试 provider 连通性，返回 `ok` / `provider` / `response` / `error` / `config_hint`
+8. 前端设置页每个 Provider 卡片新增「测试连通性」按钮，**无需先保存**即可测试，结果以绿/红卡片展示
+
+**如何使用**：
+- 打开「设置」→ LLM Provider 配置区 → 填好配置 → 点「测试连通性」
+- 成功：绿色「✓ 连通成功」+ 响应预览
+- 失败：红色「✗ 连通失败」+ 配置提示（如「api_base 可能缺少 /v1 后缀」）+ 详细错误（如「HTTP 401 未授权」）
+- 右栏分析失败时也会直接显示 `llm_error` 诊断信息
+
+**典型场景（DeepSeek 配置）**：
+- ❌ 错误：`api_base = ` `` `https://api.deepseek.com` ``（带反引号、缺 `/v1`），`model = deepseek-v4-flash`
+- ✅ 正确：`api_base = https://api.deepseek.com/v1`，`model = deepseek-chat`
+- 现在程序会自动清理反引号并提示补 `/v1`，点「测试连通性」即可看到明确诊断
+
+### 修复 2：解密目录检测不到 → 扩大扫描范围
+
+**问题**：用户把 wechat-decrypt 克隆在 `~/Study/wechat-decrypt/`，解密结果在 `~/Study/wechat-decrypt/decrypted/`，但原自动检测只扫到家目录和 wechat-ui 同级目录，检测不到。
+
+**改动文件**：
+- [backend/auto_setup.py](backend/auto_setup.py)
+
+**具体变更**：
+1. `auto_detect_decrypted_dir()` 新增第 4 步：扫描开发目录
+2. 新增 `_dev_dir_candidates()`：返回 `~/Study/`、`~/Projects/`、`~/code/`、`~/workspace/`、`~/work/`、`~/dev/`、`~/repos/`、`~/src/`、`~/github/`、`~/Code/` 等开发目录
+3. 新增 `_scan_dev_dirs_for_decrypted()`：在开发目录下查找 `wechat-decrypt/decrypted`、`wechat-decrypt-ref/decrypted`、`wechat_decrypt/decrypted` 以及直接放在开发目录下的 `decrypted/`
+4. `_wechat_decrypt_dir_candidates()` 同步扩展：在开发目录下查找 wechat-decrypt 项目（用于增量解密和 config.json 读取）
+
+**如何使用**：
+- 无需任何操作，自动检测会自动扫描这些开发目录
+- 把 wechat-decrypt 克隆在 `~/Study/wechat-decrypt/` 后，点「设置 → 🔍 自动检测」即可找到
+- 也可通过环境变量指定：`export WECHAT_DECRYPT_DIR=/path/to/wechat-decrypt`
+
+### 修复 3：没有增量解密触发入口 → 新增端点 + 前端按钮
+
+**问题**：原代码虽在启动时自动调 `decrypt_db.py -i` 增量解密，但运行中微信有新消息后，没有手动触发增量同步的入口，只能重启后端或点「自动检测」（会重新跑完整检测流程）。
+
+**改动文件**：
+- [backend/main.py](backend/main.py)
+- [frontend/src/components/Settings.tsx](frontend/src/components/Settings.tsx)
+- [frontend/src/api/client.ts](frontend/src/api/client.ts)
+- [frontend/src/types/index.ts](frontend/src/types/index.ts)
+
+**具体变更**：
+1. 新增 `POST /api/decrypt/incremental` 端点：复用 `auto_setup.try_auto_decrypt()` 逻辑（调用 `decrypt_db.py -i`），只解密新消息，不重新解密联系人库
+2. 成功后自动把新的 `decrypted_dir` 写回配置并重置 reader 缓存（无需重启即可看到新消息）
+3. 返回标准结构：`{ok, decrypted_dir, decrypted_count, message}`
+4. 前端设置页「数据目录」标题栏新增「⬆ 增量同步」按钮，点击后显示同步结果（成功/失败 + 解密数量 + 解密目录）
+
+**如何使用**：
+- 微信有新消息后，打开「设置」→ 数据目录 → 点「⬆ 增量同步」
+- 程序会调用 wechat-decrypt 的 `decrypt_db.py -i` 只拉取新消息
+- 完成后自动刷新配置，回到主界面即可看到最新消息
+- 失败时会显示原因（如「未找到 wechat-decrypt 项目目录」「未找到密钥文件 all_keys.json」）
+
+> 注意：增量同步需要 wechat-decrypt 项目目录和 `all_keys.json` 密钥文件就绪。macOS 首次使用需先完成密钥提取（见 Q1）。
+
+### 测试
+
+新增 23 个测试覆盖上述修复（总计 66 个，全部通过）：
+- `TestLLMErrorHandling`（16 个）：api_base 清理、/v1 检测、HTTP 错误诊断、错误透传
+- `TestAPIExtra`（5 个）：`/api/llm/test` 和 `/api/decrypt/incremental` 端点
+- `TestAutoSetup` 新增 2 个：开发目录扫描
+
+```bash
+cd wechat-ui
+python -m pytest tests/ -v          # 66 passed
+cd frontend && npx tsc --noEmit     # 0 errors
+cd frontend && npm run build        # ✓ built
 ```
 
 ---

@@ -6,7 +6,10 @@ import type {
   ContactListResponse,
   ContactType,
   HealthStatus,
+  IncrementalDecryptResult,
   IntentResult,
+  LLMProvider,
+  LLMTestResult,
   MessageListResponse,
   SearchResult,
   SortType,
@@ -154,4 +157,23 @@ export const api = {
       `/api/analyze/summary/${encodeURIComponent(username)}${qs(params)}`,
       { method: 'POST' },
     ),
+
+  // ------------------------------------------------------------------------
+  // LLM 连通性测试
+  // ------------------------------------------------------------------------
+  /** 测试某个 LLM provider 的连通性（无需先保存配置）。 */
+  testLLM: (provider: LLMProvider) =>
+    request<LLMTestResult>('/api/llm/test', {
+      method: 'POST',
+      body: JSON.stringify(provider),
+    }),
+
+  // ------------------------------------------------------------------------
+  // 增量解密
+  // ------------------------------------------------------------------------
+  /** 触发增量解密：只拉取本地库中最新消息之后的新消息。 */
+  decryptIncremental: () =>
+    request<IncrementalDecryptResult>('/api/decrypt/incremental', {
+      method: 'POST',
+    }),
 }

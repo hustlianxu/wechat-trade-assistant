@@ -30,7 +30,7 @@ try:
         classify_intent, extract_todos, summarize_conversation,
         classify_intent_rules,
     )
-    from .auto_setup import run_auto_setup, auto_detect_decrypted_dir
+    from .auto_setup import run_auto_setup, auto_detect_decrypted_dir, try_auto_decrypt
 except ImportError:
     from config import load_config, save_config, update_config, default_config
     from db_reader import DbReader, Contact, Message, split_msg_type, msg_type_name
@@ -40,7 +40,7 @@ except ImportError:
         classify_intent, extract_todos, summarize_conversation,
         classify_intent_rules,
     )
-    from auto_setup import run_auto_setup, auto_detect_decrypted_dir
+    from auto_setup import run_auto_setup, auto_detect_decrypted_dir, try_auto_decrypt
 
 
 # ============================================================================
@@ -237,6 +237,49 @@ def auto_setup_status():
     return {
         "has_decrypted_dir": decrypted_dir is not None,
         "decrypted_dir_preview": decrypted_dir or "",
+    }
+
+
+# ============================================================================
+# 增量解密：只拉取本地库中最新消息之后的新消息
+# ============================================================================
+@app.post("/api/decrypt/incremental")
+def decrypt_incremental():
+    """触发增量解密。
+
+    复用 auto_setup.try_auto_decrypt 的逻辑（调用 wechat-decrypt 的
+    `decrypt_db.py -i`），只解密本地库中尚未覆盖的新消息，不重新解密
+    联系人库。完成后把新的 decrypted_dir 写回配置并重置 reader 缓存。
+
+    返回：
+        {
+            "ok": bool,
+            "decrypted_dir": str,
+            "decrypted_count": int,
+            "message": str,
+        }
+    """
+    result = try_auto_decrypt()
+
+    if result.get("success"):
+        decrypted_dir = result.get("decrypted_dir", "") or ""
+        if decrypted_dir:
+            update_config({"decrypted_dir": decrypted_dir})
+            # 重置 reader 缓存，使其重新加载新解密的数据库
+            global _reader, _reader_dir
+            _reader = None
+            _reader_dir = ""
+        return {
+            "ok": True,
+            "decrypted_dir": decrypted_dir,
+            "decrypted_count": result.get("decrypted_count", 0),
+            "message": result.get("message", "增量解密成功"),
+        }
+    return {
+        "ok": False,
+        "decrypted_dir": "",
+        "decrypted_count": 0,
+        "message": result.get("message", "增量解密失败"),
     }
 
 
@@ -503,7 +546,7 @@ def analyze_intent(
         # 规则兜底
         all_text = " ".join(m["content"] for m in msg_list)
         intent, conf = classify_intent_rules(all_text)
-        result = {"intent": intent, "confidence": conf, "summary": "基于关键词的规则识别"}
+        result = {"intent": intent, "confidence": conf, "summary": "基于关键词的规则识别", "llm_error": ""}
 
     return result
 
@@ -539,9 +582,9 @@ def analyze_todos(
 
     llm = get_active_llm(cfg)
     if llm and llm.available:
-        todos = extract_todos(msg_list, llm)
-        return {"todos": todos}
-    return {"todos": [], "error": "未配置 LLM，无法提取待办"}
+        todos, err = extract_todos(msg_list, llm)
+        return {"todos": todos, "llm_error": err}
+    return {"todos": [], "error": "未配置 LLM，无法提取待办", "llm_error": ""}
 
 
 @app.post("/api/analyze/summary/{username}")
@@ -575,9 +618,82 @@ def analyze_summary(
 
     llm = get_active_llm(cfg)
     if llm and llm.available:
-        summary = summarize_conversation(msg_list, llm)
-        return {"summary": summary}
-    return {"summary": "未配置 LLM，无法生成总结"}
+        summary, err = summarize_conversation(msg_list, llm)
+        return {"summary": summary, "llm_error": err}
+    return {"summary": "未配置 LLM，无法生成总结", "llm_error": ""}
+
+
+# ============================================================================
+# LLM 连通性测试
+# ============================================================================
+class LLMTestRequest(BaseModel):
+    """LLM 测试请求：接收完整的 provider 配置，无需先保存即可测试。"""
+    name: str = ""
+    api_base: str
+    api_key: str
+    model: str
+    temperature: float = 0.3
+    max_tokens: int = 2000
+
+
+@app.post("/api/llm/test")
+def test_llm(req: LLMTestRequest):
+    """测试 LLM 连通性，返回详细诊断信息。
+
+    流程：
+    1. 配置校验：api_base 清理反引号、检测 /v1 后缀缺失
+    2. 实际调用：发送一条简短消息验证连通性
+
+    返回：
+        {
+            "ok": bool,
+            "provider": str,       # 识别出的 provider 名（取 host）
+            "model": str,
+            "api_base": str,       # 清理后的 api_base
+            "response": str,       # LLM 的响应文本（成功时）
+            "error": str,          # 失败时的诊断信息
+            "config_hint": str,    # 配置问题提示（如缺 /v1）
+        }
+    """
+    client = LLMClient(req.model_dump())
+
+    # 1. 配置校验
+    hint = client.validate()
+    if hint:
+        return {
+            "ok": False,
+            "provider": "",
+            "model": client.model,
+            "api_base": client.api_base,
+            "response": "",
+            "error": f"配置问题：{hint}",
+            "config_hint": hint,
+        }
+
+    # 2. 实际调用测试（发一条简短消息）
+    resp, err = client.chat(
+        [{"role": "user", "content": "请回复 ok"}],
+        temperature=0,
+    )
+    if resp:
+        return {
+            "ok": True,
+            "provider": client.api_base.split("//")[-1].split("/")[0],
+            "model": client.model,
+            "api_base": client.api_base,
+            "response": resp[:200],
+            "error": "",
+            "config_hint": "",
+        }
+    return {
+        "ok": False,
+        "provider": client.api_base.split("//")[-1].split("/")[0],
+        "model": client.model,
+        "api_base": client.api_base,
+        "response": "",
+        "error": err,
+        "config_hint": "",
+    }
 
 
 # ============================================================================

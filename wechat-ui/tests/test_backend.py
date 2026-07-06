@@ -526,3 +526,270 @@ class TestAutoSetup:
         assert result["self_wxid"] == "wxid_self"
         assert isinstance(result["messages"], list)
         assert len(result["messages"]) > 0
+
+    def test_auto_detect_scans_dev_dirs(self, mock_decrypted_dir, monkeypatch, tmp_path):
+        """auto_detect_decrypted_dir 应能扫描到 ~/Study/wechat-decrypt/decrypted。"""
+        from backend import auto_setup
+
+        # 构造 ~/Study/wechat-decrypt/decrypted/ 结构（用 tmp_path 模拟家目录）
+        home = tmp_path
+        study_dir = home / "Study" / "wechat-decrypt"
+        study_dir.mkdir(parents=True)
+        # 把模拟解密目录复制到 Study/wechat-decrypt/decrypted
+        import shutil
+        shutil.copytree(mock_decrypted_dir, str(study_dir / "decrypted"))
+
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(auto_setup, "find_wechat_decrypt_dir", lambda: None)
+        monkeypatch.setattr(auto_setup, "load_wcd_config", lambda: {})
+
+        found = auto_setup.auto_detect_decrypted_dir()
+        assert found is not None
+        assert "Study" in found
+        assert found.endswith("decrypted")
+
+    def test_dev_dir_candidates_includes_study(self, monkeypatch, tmp_path):
+        """_dev_dir_candidates 应包含 ~/Study。"""
+        from backend import auto_setup
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        (tmp_path / "Study").mkdir()
+        (tmp_path / "Projects").mkdir()
+        candidates = auto_setup._dev_dir_candidates()
+        candidate_strs = [str(p) for p in candidates]
+        assert any("Study" in s for s in candidate_strs)
+        assert any("Projects" in s for s in candidate_strs)
+
+
+# ============================================================================
+# LLM 错误透传与 api_base 清理测试
+# ============================================================================
+class TestLLMErrorHandling:
+    """修复1：LLM 错误透传 + api_base 清理 + /v1 后缀检测。"""
+
+    def test_sanitize_api_base_strips_backticks(self):
+        """反引号应被剥离（用户从 Markdown 文档复制时常见）。"""
+        from backend.llm import _sanitize_api_base
+        assert _sanitize_api_base("`https://api.deepseek.com/v1`") == "https://api.deepseek.com/v1"
+        assert _sanitize_api_base("``https://api.deepseek.com/v1``") == "https://api.deepseek.com/v1"
+        assert _sanitize_api_base("'https://api.test.com/v1'") == "https://api.test.com/v1"
+        assert _sanitize_api_base('"https://api.test.com/v1"') == "https://api.test.com/v1"
+
+    def test_sanitize_api_base_strips_trailing_slash(self):
+        """末尾斜杠应被剥离。"""
+        from backend.llm import _sanitize_api_base
+        assert _sanitize_api_base("https://api.test.com/v1/") == "https://api.test.com/v1"
+        assert _sanitize_api_base("https://api.test.com/v1///") == "https://api.test.com/v1"
+
+    def test_sanitize_api_base_strips_whitespace(self):
+        """首尾空格应被剥离。"""
+        from backend.llm import _sanitize_api_base
+        assert _sanitize_api_base("  https://api.test.com/v1  ") == "https://api.test.com/v1"
+
+    def test_sanitize_api_base_empty(self):
+        """空值应返回空字符串。"""
+        from backend.llm import _sanitize_api_base
+        assert _sanitize_api_base("") == ""
+        assert _sanitize_api_base(None) == ""  # type: ignore[arg-type]
+
+    def test_validate_api_base_missing_v1_for_known_provider(self):
+        """已知 provider 缺少 /v1 后缀应给出提示。"""
+        from backend.llm import validate_api_base
+        hint = validate_api_base("https://api.deepseek.com")
+        assert hint is not None
+        assert "/v1" in hint
+
+    def test_validate_api_base_missing_v1_openai(self):
+        from backend.llm import validate_api_base
+        hint = validate_api_base("https://api.openai.com")
+        assert hint is not None
+        assert "/v1" in hint
+
+    def test_validate_api_base_ok_with_v1(self):
+        """带 /v1 的地址不应有提示。"""
+        from backend.llm import validate_api_base
+        assert validate_api_base("https://api.deepseek.com/v1") is None
+        assert validate_api_base("https://api.openai.com/v1") is None
+
+    def test_validate_api_base_ok_unknown_provider_no_v1(self):
+        """未知 provider（如本地 ollama）缺 /v1 不应报警。"""
+        from backend.llm import validate_api_base
+        assert validate_api_base("http://localhost:11434") is None
+
+    def test_validate_api_base_empty(self):
+        from backend.llm import validate_api_base
+        hint = validate_api_base("")
+        assert hint is not None
+        assert "空" in hint
+
+    def test_llm_client_init_sanitizes_api_base(self):
+        """LLMClient 构造时应自动清理 api_base。"""
+        from backend.llm import LLMClient
+        client = LLMClient({
+            "api_base": "`https://api.deepseek.com/v1`",
+            "api_key": "sk-test",
+            "model": "deepseek-chat",
+        })
+        assert client.api_base == "https://api.deepseek.com/v1"
+
+    def test_llm_client_validate_method(self):
+        """LLMClient.validate() 应返回诊断提示。"""
+        from backend.llm import LLMClient
+        client = LLMClient({
+            "api_base": "https://api.deepseek.com",  # 缺 /v1
+            "api_key": "sk-test",
+            "model": "deepseek-chat",
+        })
+        hint = client.validate()
+        assert hint is not None
+        assert "/v1" in hint
+
+    def test_diagnose_http_error_401(self):
+        from backend.llm import _diagnose_http_error
+        msg = _diagnose_http_error(401, "", "https://api.test.com/v1/chat/completions")
+        assert "401" in msg
+        assert "api_key" in msg
+
+    def test_diagnose_http_error_404(self):
+        from backend.llm import _diagnose_http_error
+        msg = _diagnose_http_error(404, "not found", "https://api.test.com/v1/chat/completions")
+        assert "404" in msg
+        assert "/v1" in msg or "model" in msg
+
+    def test_diagnose_http_error_500(self):
+        from backend.llm import _diagnose_http_error
+        msg = _diagnose_http_error(500, "server error", "https://api.test.com/v1/chat/completions")
+        assert "500" in msg
+
+    def test_chat_returns_tuple_on_missing_config(self):
+        """配置缺失时 chat 应返回 (None, error) 元组。"""
+        from backend.llm import LLMClient
+        client = LLMClient({})
+        content, err = client.chat([{"role": "user", "content": "hi"}])
+        assert content is None
+        assert isinstance(err, str)
+        assert len(err) > 0
+
+    def test_classify_intent_returns_llm_error_field(self, monkeypatch):
+        """classify_intent 在 LLM 调用失败时应返回 llm_error 字段。"""
+        from backend import llm as llm_module
+        from backend.llm import LLMClient, classify_intent
+
+        client = LLMClient({
+            "api_base": "https://api.deepseek.com/v1",
+            "api_key": "sk-invalid",
+            "model": "deepseek-chat",
+        })
+        # mock chat 方法模拟失败
+        monkeypatch.setattr(
+            client, "chat",
+            lambda messages, temperature=None: (None, "LLM 调用失败 (HTTP 401 未授权)")
+        )
+        result = classify_intent(
+            [{"sender": "对方", "content": "你好", "time": "2024-01-01"}],
+            client,
+        )
+        assert result["intent"] == "error"
+        assert "llm_error" in result
+        assert "401" in result["llm_error"]
+
+
+# ============================================================================
+# LLM 测试端点 + 增量解密端点测试
+# ============================================================================
+class TestAPIExtra:
+    """修复1（/api/llm/test）+ 修复3（/api/decrypt/incremental）端点测试。"""
+
+    @pytest.fixture
+    def client(self, mock_decrypted_dir, monkeypatch, tmp_path):
+        from backend import config as cfg_module
+        monkeypatch.setattr(cfg_module.Path, "home", lambda: tmp_path)
+        cfg_module.save_config({
+            "decrypted_dir": mock_decrypted_dir,
+            "self_wxid": "wxid_self",
+        })
+        from backend.main import app
+        from fastapi.testclient import TestClient
+        return TestClient(app)
+
+    def test_llm_test_missing_v1_returns_config_hint(self, client):
+        """/api/llm/test 对缺 /v1 的 deepseek 地址应返回 config_hint。"""
+        resp = client.post("/api/llm/test", json={
+            "name": "deepseek",
+            "api_base": "https://api.deepseek.com",  # 缺 /v1
+            "api_key": "sk-test",
+            "model": "deepseek-chat",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["config_hint"]  # 非空
+        assert "/v1" in data["config_hint"]
+
+    def test_llm_test_sanitizes_backticks(self, client):
+        """/api/llm/test 应清理 api_base 中的反引号（不会因反引号而误判）。"""
+        resp = client.post("/api/llm/test", json={
+            "name": "deepseek",
+            "api_base": "`https://api.deepseek.com/v1`",  # 带反引号但有 /v1
+            "api_key": "sk-test",
+            "model": "deepseek-chat",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        # 反引号被清理后 api_base 应是干净的
+        assert data["api_base"] == "https://api.deepseek.com/v1"
+        # config_hint 应为空（清理后地址合法）
+        assert data["config_hint"] == ""
+
+    def test_llm_test_empty_api_base(self, client):
+        """/api/llm/test 对空 api_base 应返回错误。"""
+        resp = client.post("/api/llm/test", json={
+            "name": "test",
+            "api_base": "",
+            "api_key": "sk-test",
+            "model": "gpt-4",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert "空" in data["error"] or "空" in data["config_hint"]
+
+    def test_decrypt_incremental_endpoint_exists(self, client, monkeypatch):
+        """/api/decrypt/incremental 端点应存在并返回标准结构。"""
+        from backend import main as main_module
+        # mock try_auto_decrypt 避免真实调用 wechat-decrypt
+        monkeypatch.setattr(
+            main_module, "try_auto_decrypt",
+            lambda timeout=300: {
+                "success": True,
+                "message": "解密成功（增量模式，5 个数据库）",
+                "decrypted_dir": "/tmp/fake_decrypted",
+                "decrypted_count": 5,
+            }
+        )
+        resp = client.post("/api/decrypt/incremental")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["decrypted_dir"] == "/tmp/fake_decrypted"
+        assert data["decrypted_count"] == 5
+        assert "解密成功" in data["message"]
+
+    def test_decrypt_incremental_failure(self, client, monkeypatch):
+        """/api/decrypt/incremental 在解密失败时应返回 ok=false。"""
+        from backend import main as main_module
+        monkeypatch.setattr(
+            main_module, "try_auto_decrypt",
+            lambda timeout=300: {
+                "success": False,
+                "message": "未找到 wechat-decrypt 项目目录",
+                "decrypted_dir": None,
+                "decrypted_count": 0,
+            }
+        )
+        resp = client.post("/api/decrypt/incremental")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["decrypted_count"] == 0
+        assert "未找到" in data["message"]

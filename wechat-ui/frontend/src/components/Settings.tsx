@@ -1,6 +1,13 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
-import type { AppConfig, AutoSetupResult, LLMProvider, WhisperConfig } from '../types'
+import type {
+  AppConfig,
+  AutoSetupResult,
+  IncrementalDecryptResult,
+  LLMProvider,
+  LLMTestResult,
+  WhisperConfig,
+} from '../types'
 
 interface Props {
   /** 当前配置（可能为 null，此时弹窗会拉取）。 */
@@ -50,6 +57,12 @@ export default function Settings({ config, onClose, onSaved }: Props) {
   const [savedHint, setSavedHint] = useState<string>('')
   const [autoRunning, setAutoRunning] = useState<boolean>(false)
   const [autoResult, setAutoResult] = useState<AutoSetupResult | null>(null)
+  // LLM 测试状态：key 为 provider 索引
+  const [llmTesting, setLlmTesting] = useState<Record<number, boolean>>({})
+  const [llmTestResults, setLlmTestResults] = useState<Record<number, LLMTestResult>>({})
+  // 增量解密状态
+  const [incrementalRunning, setIncrementalRunning] = useState<boolean>(false)
+  const [incrementalResult, setIncrementalResult] = useState<IncrementalDecryptResult | null>(null)
 
   // 首次打开若没有传入配置，则拉取
   useEffect(() => {
@@ -155,6 +168,65 @@ export default function Settings({ config, onClose, onSaved }: Props) {
     updateField('active_llm', name)
   }
 
+  /** 测试某个 provider 的连通性（无需先保存）。 */
+  const handleTestLLM = async (idx: number) => {
+    const provider = draft.llm_providers[idx]
+    if (!provider) return
+    setLlmTesting((m) => ({ ...m, [idx]: true }))
+    setLlmTestResults((m) => {
+      const next = { ...m }
+      delete next[idx]
+      return next
+    })
+    try {
+      const result = await api.testLLM(provider)
+      setLlmTestResults((m) => ({ ...m, [idx]: result }))
+    } catch (e) {
+      setLlmTestResults((m) => ({
+        ...m,
+        [idx]: {
+          ok: false,
+          provider: '',
+          model: provider.model,
+          api_base: provider.api_base,
+          response: '',
+          error: e instanceof Error ? e.message : '测试失败',
+          config_hint: '',
+        },
+      }))
+    } finally {
+      setLlmTesting((m) => ({ ...m, [idx]: false }))
+    }
+  }
+
+  /** 触发增量解密：只拉取本地库中最新消息之后的新消息。 */
+  const handleIncrementalDecrypt = async () => {
+    setIncrementalRunning(true)
+    setIncrementalResult(null)
+    setError('')
+    try {
+      const result = await api.decryptIncremental()
+      setIncrementalResult(result)
+      // 成功后重置 reader 缓存：刷新配置中的 decrypted_dir（若被更新）
+      if (result.ok) {
+        try {
+          const fresh = await api.getConfig()
+          setDraft((d) => ({
+            ...d,
+            decrypted_dir: fresh.decrypted_dir || d.decrypted_dir,
+          }))
+          onSaved(fresh)
+        } catch {
+          // 忽略刷新失败
+        }
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '增量解密失败')
+    } finally {
+      setIncrementalRunning(false)
+    }
+  }
+
   /** 保存配置。 */
   const handleSave = async () => {
     setSaving(true)
@@ -203,12 +275,47 @@ export default function Settings({ config, onClose, onSaved }: Props) {
                     className="btn btn--primary btn--small"
                     style={{ marginLeft: 'auto' }}
                     onClick={() => triggerAutoSetup(true)}
-                    disabled={autoRunning}
+                    disabled={autoRunning || incrementalRunning}
                     title="自动检测微信数据目录、自动解密、自动填 wxid"
                   >
                     {autoRunning ? '检测中…' : '🔍 自动检测'}
                   </button>
+                  <button
+                    className="btn btn--default btn--small"
+                    style={{ marginLeft: 8 }}
+                    onClick={handleIncrementalDecrypt}
+                    disabled={autoRunning || incrementalRunning}
+                    title="只拉取本地库中最新消息之后的新消息，不重新解密联系人库"
+                  >
+                    {incrementalRunning ? '同步中…' : '⬆ 增量同步'}
+                  </button>
                 </div>
+
+                {/* 增量同步结果 */}
+                {incrementalResult && (
+                  <div
+                    className="auto-setup-result"
+                    style={{
+                      borderColor: incrementalResult.ok
+                        ? 'var(--color-success, #16a34a)'
+                        : 'var(--color-danger, #dc2626)',
+                    }}
+                  >
+                    <div className="auto-setup-result__line">
+                      {incrementalResult.ok ? '✓' : '✗'} {incrementalResult.message}
+                      {incrementalResult.ok && incrementalResult.decrypted_count > 0 && (
+                        <span style={{ marginLeft: 8, color: '#666' }}>
+                          （{incrementalResult.decrypted_count} 个数据库）
+                        </span>
+                      )}
+                    </div>
+                    {incrementalResult.decrypted_dir && (
+                      <div className="auto-setup-result__line" style={{ color: '#666', fontSize: 12 }}>
+                        解密目录：{incrementalResult.decrypted_dir}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* 自动检测结果 */}
                 {autoResult && (
@@ -348,6 +455,14 @@ export default function Settings({ config, onClose, onSaved }: Props) {
                           </div>
                           <div className="llm-item__actions">
                             <button
+                              className="llm-item__action-btn"
+                              onClick={() => handleTestLLM(idx)}
+                              disabled={!!llmTesting[idx] || !p.api_base || !p.api_key || !p.model}
+                              title="测试此 provider 的连通性（无需先保存）"
+                            >
+                              {llmTesting[idx] ? '测试中…' : '测试连通性'}
+                            </button>
+                            <button
                               className="llm-item__action-btn llm-item__action-btn--danger"
                               onClick={() => handleDeleteProvider(idx)}
                             >
@@ -355,6 +470,58 @@ export default function Settings({ config, onClose, onSaved }: Props) {
                             </button>
                           </div>
                         </div>
+                        {/* LLM 测试结果 */}
+                        {llmTestResults[idx] && (
+                          <div
+                            className="llm-item__test-result"
+                            style={{
+                              margin: '8px 0',
+                              padding: '8px 10px',
+                              borderRadius: 4,
+                              fontSize: 12,
+                              lineHeight: 1.6,
+                              background: llmTestResults[idx].ok ? '#f0fdf4' : '#fef2f2',
+                              border: `1px solid ${
+                                llmTestResults[idx].ok ? '#bbf7d0' : '#fecaca'
+                              }`,
+                              color: llmTestResults[idx].ok ? '#166534' : '#991b1b',
+                            }}
+                          >
+                            {llmTestResults[idx].ok ? (
+                              <>
+                                <div>
+                                  <strong>✓ 连通成功</strong>
+                                  {llmTestResults[idx].provider && (
+                                    <span style={{ marginLeft: 6, color: '#666' }}>
+                                      ({llmTestResults[idx].provider})
+                                    </span>
+                                  )}
+                                </div>
+                                {llmTestResults[idx].response && (
+                                  <div style={{ marginTop: 4, color: '#555' }}>
+                                    响应：{llmTestResults[idx].response}
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <>
+                                <div>
+                                  <strong>✗ 连通失败</strong>
+                                </div>
+                                {llmTestResults[idx].config_hint && (
+                                  <div style={{ marginTop: 4, fontWeight: 600 }}>
+                                    配置提示：{llmTestResults[idx].config_hint}
+                                  </div>
+                                )}
+                                {llmTestResults[idx].error && (
+                                  <div style={{ marginTop: 4, color: '#7f1d1d' }}>
+                                    {llmTestResults[idx].error}
+                                  </div>
+                                )}
+                              </>
+                            )}
+                          </div>
+                        )}
                         <div className="llm-item__fields">
                           <input
                             type="text"
