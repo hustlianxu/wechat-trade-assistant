@@ -120,18 +120,6 @@ def _resolve_images_in_background(repo, data_dir):
             repo.set_setting("media_resolved_ts", str(int(_time.time())))
     except Exception:
         pass
-    return schemas.ContactOut(
-        id=c.id,
-        wxid=c.wxid,
-        nickname=c.nickname,
-        remark=c.remark,
-        alias=c.alias,
-        region=c.region,
-        last_intent=c.last_intent,
-        last_intent_ts=c.last_intent_ts,
-        last_msg_ts=c.last_msg_ts,
-        note=c.note,
-    )
 
 
 def _contact_to_out(c: Contact) -> schemas.ContactOut:
@@ -143,7 +131,8 @@ def _contact_to_out(c: Contact) -> schemas.ContactOut:
         alias=c.alias,
         region=c.region,
         last_intent=c.last_intent,
-        updated_at=c.updated_at,
+        last_intent_ts=c.last_intent_ts,
+        last_msg_ts=c.last_msg_ts,
         note=c.note,
     )
 
@@ -480,6 +469,7 @@ def assistant_query(req: schemas.AssistantQueryRequest) -> schemas.AssistantMess
         matched_msg_ids=msg_ids_str,
         latency_ms=result.latency_ms,
         engine=result.engine,
+        llm_error=result.llm_error,
         messages=[_message_to_out(m) for m in result.messages],
         contacts=[_contact_to_out(c) for c in result.contacts],
         todos=[_todo_to_out(t) for t in result.todos],
@@ -594,6 +584,85 @@ def clear_llm_config() -> schemas.OkResponse:
     return schemas.OkResponse(message="LLM 配置已清除")
 
 
+@router.post("/llm/test", response_model=schemas.LLMTestResult)
+def test_llm(req: schemas.LLMConfigRequest) -> schemas.LLMTestResult:
+    """测试 LLM 连通性，返回详细诊断信息。
+
+    接收完整的 LLM 配置（无需先保存即可测试），执行：
+    1. 配置校验：api_base 清理反引号、检测 /v1 后缀缺失
+    2. 实际调用：发送一条简短消息验证连通性
+    """
+    config = CloudLLMConfig(req.api_base, req.api_key, req.model, req.timeout)
+
+    # 1. 配置校验
+    hint = config.validate()
+    if hint:
+        return schemas.LLMTestResult(
+            ok=False,
+            provider="",
+            config_hint=hint,
+            error=f"配置问题：{hint}",
+        )
+
+    # 2. 实际调用测试（发一条简短消息）
+    import httpx
+    url = f"{config.api_base}/chat/completions"
+    try:
+        with httpx.Client(timeout=config.timeout) as client:
+            resp = client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {config.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": config.model,
+                    "messages": [{"role": "user", "content": "请回复 ok"}],
+                    "temperature": 0,
+                    "max_tokens": 10,
+                },
+            )
+        if resp.status_code >= 400:
+            body = resp.text[:500] if resp.text else ""
+            from ..mcp.responder import _diagnose_http_error
+            diag = _diagnose_http_error(resp.status_code, body, url, "")
+            return schemas.LLMTestResult(
+                ok=False,
+                model=config.model,
+                api_base=config.api_base,
+                error=diag,
+            )
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        return schemas.LLMTestResult(
+            ok=True,
+            model=config.model,
+            api_base=config.api_base,
+            response=content[:200],
+        )
+    except httpx.ConnectError as e:
+        return schemas.LLMTestResult(
+            ok=False,
+            model=config.model,
+            api_base=config.api_base,
+            error=f"网络连接失败：{e}。请检查 api_base 是否可访问、网络是否需要代理。URL: {url}",
+        )
+    except httpx.TimeoutException:
+        return schemas.LLMTestResult(
+            ok=False,
+            model=config.model,
+            api_base=config.api_base,
+            error=f"调用超时（{config.timeout}s）。URL: {url}",
+        )
+    except Exception as e:  # noqa: BLE001
+        return schemas.LLMTestResult(
+            ok=False,
+            model=config.model,
+            api_base=config.api_base,
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
 @router.post("/settings/realtime", response_model=schemas.OkResponse)
 def set_realtime_listen(req: schemas.RealtimeListenRequest) -> schemas.OkResponse:
     repo = get_repo()
@@ -671,6 +740,30 @@ def decrypt_status() -> schemas.DecryptStatusResponse:
         needs_admin=False,  # Windows 上需要管理员，前端按平台判断
         data_dirs=[str(p) for p in find_wechat_data_dirs(version_info)] if version_info else [],
         last_decrypt_run=last_run,
+    )
+
+
+@router.post("/decrypt/incremental", response_model=schemas.IncrementalDecryptResponse)
+def decrypt_incremental() -> schemas.IncrementalDecryptResponse:
+    """手动触发一次增量同步：只拉取本地库中最新消息之后的新消息。
+
+    与 `/decrypt/trigger` 的区别：
+    - 不重新解密联系人库、不重跑全量消息导入
+    - 仅扫描消息库中 created_ts > 本地最大 created_ts 的消息
+    - 适合在实时监听未开启时，用户手动点一下拉取增量
+
+    返回新增消息数、使用的数据库路径等信息。
+    """
+    # 延迟导入避免循环依赖：main 模块在 import 时会构造 app 实例
+    from ..main import incremental_sync_once
+
+    result = incremental_sync_once()
+    return schemas.IncrementalDecryptResponse(
+        ok=bool(result.get("ok", False)),
+        message=result.get("message", ""),
+        new_msg_count=int(result.get("new_msg_count", 0)),
+        data_dir=result.get("data_dir", ""),
+        db_path=result.get("db_path", ""),
     )
 
 

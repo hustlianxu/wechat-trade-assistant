@@ -37,6 +37,11 @@ function TurnView({ turn }: { turn: AssistantMessageOut }) {
             <span>耗时 {turn.latency_ms}ms</span>
             {turn.created_ts ? <span>· {fmtTs(turn.created_ts)}</span> : null}
           </div>
+          {turn.llm_error ? (
+            <div className="assistant-llm-error" title="云端 LLM 调用失败，已降级到本地。点击设置页「测试」按钮诊断配置。">
+              ⚠ 云端 LLM 调用失败，已降级本地：{turn.llm_error}
+            </div>
+          ) : null}
           <div className="assistant-content">{turn.content || '(无回复内容)'}</div>
 
           <CollapsibleSection

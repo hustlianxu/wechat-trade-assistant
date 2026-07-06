@@ -114,9 +114,20 @@ export interface AssistantMessageOut {
   latency_ms: number;
   engine: string;
   created_ts: number | null;
+  /** 云端 LLM 调用失败时的诊断信息（仅当曾尝试云端但降级到本地时非空） */
+  llm_error?: string;
   messages: MessageOut[];
   contacts: ContactOut[];
   todos: TodoOut[];
+}
+export interface LLMTestResult {
+  ok: boolean;
+  provider?: string;
+  model?: string;
+  api_base?: string;
+  response?: string;
+  error?: string;
+  config_hint?: string;
 }
 export interface AssistantHistoryResponse {
   turns: AssistantMessageOut[];
@@ -186,6 +197,14 @@ export interface DecryptTriggerResponse {
   msg_count: number;
   contact_count: number;
   db_results: DecryptDbResult[];
+}
+/** 增量同步结果：仅拉取本地库中已存在消息之后的新消息。 */
+export interface IncrementalDecryptResponse {
+  ok: boolean;
+  message: string;
+  new_msg_count: number;
+  data_dir: string;
+  db_path: string;
 }
 
 // 渲染进程通过 preload 暴露的全局 API 类型

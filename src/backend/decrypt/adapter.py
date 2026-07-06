@@ -133,6 +133,64 @@ def _detect_platform() -> Platform:
 # ----------------------------------------------------------------------------
 # 数据库路径定位
 # ----------------------------------------------------------------------------
+
+# 常见开发目录（相对家目录），用于扫描自建的 wechat-decrypt 解密输出
+_DEV_SUBDIRS = (
+    "Study", "Projects", "code", "dev", "work",
+    "Documents", "Desktop", "Downloads",
+)
+
+
+def _extend_dev_dir_candidates(candidates: list[Path]) -> None:
+    """扫描家目录下常见开发目录，查找 wechat-decrypt 解密输出。
+
+    覆盖场景：
+    - ~/Study/wechat-decrypt/decrypted/<wxid>/
+    - ~/Projects/wechat-decrypt/decrypted/
+    - 任意 ~/<dev_dir>/<project>/decrypted/
+
+    以及家目录直接子目录里的 wechat-decrypt 项目（任意一级子目录）。
+    """
+    home = Path.home()
+    if not home.is_dir():
+        return
+
+    # 1. 已知开发目录下的 wechat-decrypt 项目
+    for sub in _DEV_SUBDIRS:
+        wcd = home / sub / "wechat-decrypt"
+        if wcd.is_dir():
+            dec = wcd / "decrypted"
+            if dec.is_dir():
+                candidates.append(dec)
+                # decrypted 下可能有多个 wxid 子目录
+                for acct in dec.iterdir():
+                    if acct.is_dir() and (acct / "message").exists():
+                        candidates.append(acct)
+
+    # 2. 家目录直接子目录里的 wechat-decrypt 项目（覆盖任意 ~/<dir>/wechat-decrypt）
+    _SYS_DIRS = {
+        "Library", "Applications", "Movies", "Music", "Pictures",
+        "Public", "Pictures", "AppData", "Cache",
+    }
+    try:
+        for top in home.iterdir():
+            if not top.is_dir() or top.name.startswith("."):
+                continue
+            if top.name in _SYS_DIRS:
+                continue
+            for sub in ("wechat-decrypt", "wechat-decrypt-ref"):
+                wcd = top / sub
+                if (wcd / "decrypt_db.py").exists() or (wcd / "decrypted").is_dir():
+                    dec = wcd / "decrypted"
+                    if dec.is_dir():
+                        candidates.append(dec)
+                        for acct in dec.iterdir():
+                            if acct.is_dir() and (acct / "message").exists():
+                                candidates.append(acct)
+    except (PermissionError, OSError):
+        pass
+
+
 def find_wechat_data_dirs(version: WeChatVersionInfo) -> list[Path]:
     """根据版本与平台，定位微信用户数据目录候选列表。
 
@@ -242,6 +300,10 @@ def find_wechat_data_dirs(version: WeChatVersionInfo) -> list[Path]:
                 candidates.append(root)
     elif plat == Platform.LINUX:
         candidates.append(Path.home() / ".config" / "WeChat")
+
+    # 跨平台：扫描常见开发目录下的 wechat-decrypt 解密输出
+    # 覆盖用户在 ~/Study/wechat-decrypt/decrypted 等位置自建解密项目的场景
+    _extend_dev_dir_candidates(candidates)
 
     # 去重并过滤存在的
     _EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e"  # MD5("")，空用户目录，应排除

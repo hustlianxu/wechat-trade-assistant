@@ -198,6 +198,122 @@ def _on_new_messages_callback(messages) -> None:
         logger.exception("实时消息处理失败：%s", e)
 
 
+def incremental_sync_once() -> dict:
+    """手动触发一次增量同步：拉取微信库中的新消息并写入本地库。
+
+    与持续运行的 PollingListener 不同，此函数只执行一次轮询，适合用户
+    在设置页点击「增量同步」按钮时调用。
+
+    返回：
+        {
+            "ok": bool,
+            "message": str,
+            "new_msg_count": int,
+            "data_dir": str,        # 使用的数据目录
+            "db_path": str,         # 使用的消息库路径
+        }
+    """
+    try:
+        from .decrypt import (
+            SSEConfig,
+            PollingListener,
+            detect_installed_wechat,
+            extract_key,
+            find_msg_db,
+            find_wechat_data_dirs,
+            open_decrypted_db,
+        )
+
+        version_info = detect_installed_wechat()
+        if version_info is None:
+            return {"ok": False, "message": "未检测到微信安装",
+                    "new_msg_count": 0, "data_dir": "", "db_path": ""}
+
+        data_dirs = find_wechat_data_dirs(version_info)
+        if not data_dirs:
+            return {"ok": False, "message": "未找到微信数据目录",
+                    "new_msg_count": 0, "data_dir": "", "db_path": ""}
+
+        msg_db = find_msg_db(version_info, data_dirs[0])
+        if msg_db is None:
+            return {"ok": False, "message": "未找到消息数据库",
+                    "new_msg_count": 0,
+                    "data_dir": str(data_dirs[0]), "db_path": ""}
+
+        try:
+            key = extract_key(version_info, source="auto")
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"密钥提取失败：{e}",
+                    "new_msg_count": 0,
+                    "data_dir": str(data_dirs[0]), "db_path": str(msg_db)}
+
+        # 用一个临时 listener 执行单次轮询，复用既有逻辑
+        # _last_ts 初始化为本地库中最新消息的 created_ts，只拉增量
+        repo = get_repo()
+        last_ts = repo.get_latest_message_ts() or 0
+        # 若本地无消息，回退 lookback 一段时间（默认 600s）
+        import time as _time
+        if last_ts == 0:
+            last_ts = int(_time.time()) - 600
+
+        new_parsed: list = []
+        try:
+            conn = open_decrypted_db(msg_db, key.key_bytes,
+                                     version_info.sqlcipher_compatibility)
+            try:
+                from .decrypt.parser import iter_messages, to_message_model
+                for parsed in iter_messages(conn, version_info):
+                    if parsed.created_ts <= last_ts:
+                        continue
+                    new_parsed.append(parsed)
+                    if parsed.created_ts > last_ts:
+                        last_ts = parsed.created_ts
+                    if len(new_parsed) >= 500:
+                        break
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"读取消息库失败：{e}",
+                    "new_msg_count": 0,
+                    "data_dir": str(data_dirs[0]), "db_path": str(msg_db)}
+
+        # 落库：用 parsed.talker_wxid 查 contact_id，再转 Message
+        if new_parsed:
+            from .decrypt.parser import to_message_model
+            from .intent import classify as classify_intent
+            from .todo import TodoManager
+            msgs_to_insert = []
+            for parsed in new_parsed:
+                cid = repo.get_contact_id_by_wxid(parsed.talker_wxid)
+                if cid is None:
+                    # 联系人未导入，跳过（用户应先做一次全量解密导入联系人）
+                    continue
+                m = to_message_model(parsed, cid)
+                if m.content and m.msg_type == "text":
+                    intent, conf = classify_intent(m.content)
+                    m.intent = intent
+                    m.confidence = conf
+                msgs_to_insert.append(m)
+            if msgs_to_insert:
+                repo.insert_messages_bulk(msgs_to_insert)
+                TodoManager(repo).extract_and_save(msgs_to_insert)
+            new_count = len(msgs_to_insert)
+        else:
+            new_count = 0
+
+        return {
+            "ok": True,
+            "message": f"增量同步完成，新增 {new_count} 条消息",
+            "new_msg_count": new_count,
+            "data_dir": str(data_dirs[0]),
+            "db_path": str(msg_db),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("增量同步失败")
+        return {"ok": False, "message": f"增量同步失败：{e}",
+                "new_msg_count": 0, "data_dir": "", "db_path": ""}
+
+
 # ----------------------------------------------------------------------------
 # 启动入口
 # ----------------------------------------------------------------------------

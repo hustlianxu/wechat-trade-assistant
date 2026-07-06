@@ -159,6 +159,15 @@ class Repository:
         row = cur.fetchone()
         return _row_to_contact(row) if row else None
 
+    def get_latest_message_ts(self) -> int:
+        """返回本地库中最大的 created_ts（秒），无消息时返回 0。"""
+        row = self.db.execute(
+            "SELECT MAX(created_ts) AS m FROM messages"
+        ).fetchone()
+        if row is None or row["m"] is None:
+            return 0
+        return int(row["m"])
+
     def get_contact_id_by_wxid(self, wxid: str) -> Optional[int]:
         """按 wxid 查询客户主键 id，不存在返回 None。"""
         conn = self.db.connect()

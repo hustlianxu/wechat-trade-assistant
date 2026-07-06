@@ -215,3 +215,47 @@ class TestSettingsAPI:
         assert r.status_code == 200
         s = c.get("/api/settings").json()
         assert s["realtime_listen"] is True
+
+    def test_llm_test_detects_missing_v1_suffix(self, tmp_data_dir):
+        """LLM 测试端点应识别 DeepSeek 等 provider 缺少 /v1 后缀的配置问题。"""
+        app = create_app()
+        from fastapi.testclient import TestClient
+        c = TestClient(app)
+        r = c.post("/api/llm/test", json={
+            "api_base": "https://api.deepseek.com",
+            "api_key": "sk-test",
+            "model": "deepseek-chat",
+            "timeout": 5.0,
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        # 应给出 /v1 后缀缺失的提示
+        assert "/v1" in body["config_hint"]
+
+    def test_llm_test_strips_backticks_from_api_base(self, tmp_data_dir):
+        """api_base 中混入的反引号应被自动清理，且能识别清理后的 provider。"""
+        from backend.mcp.responder import CloudLLMConfig
+        cfg = CloudLLMConfig("`https://api.deepseek.com`", "sk-x", "deepseek-chat")
+        # 反引号应被去除
+        assert cfg.api_base == "https://api.deepseek.com"
+        # 仍应识别出缺少 /v1
+        hint = cfg.validate()
+        assert hint and "/v1" in hint
+
+
+class TestDecryptIncremental:
+    def test_incremental_no_wechat(self, tmp_data_dir):
+        """沙箱环境无微信安装时，增量同步应返回 ok=False + 友好提示。"""
+        app = create_app()
+        from fastapi.testclient import TestClient
+        c = TestClient(app)
+        r = c.post("/api/decrypt/incremental")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        assert body["new_msg_count"] == 0
+        # 应返回字段完整的结构（data_dir / db_path 可空但必须存在）
+        assert "data_dir" in body
+        assert "db_path" in body
+        assert "message" in body and body["message"]

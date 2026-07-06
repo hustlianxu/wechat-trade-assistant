@@ -106,3 +106,6 @@ class MessageSearchResult(BaseModel):
     summary: str = ""  # 本地或云端生成的摘要
     engine: str = "local"  # local / cloud
     latency_ms: int = 0
+    # 云端 LLM 调用失败时的诊断信息（含 HTTP 状态码、URL、配置提示）。
+    # 非空时表示曾尝试云端但降级到本地，前端可据此提示用户检查 LLM 配置。
+    llm_error: str = ""

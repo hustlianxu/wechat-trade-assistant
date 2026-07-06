@@ -173,10 +173,23 @@ class AssistantMessageOut(BaseModel):
     latency_ms: int = 0
     engine: str = "local"
     created_ts: Optional[int] = None
+    # 云端 LLM 调用失败时的诊断信息（仅当曾尝试云端但降级到本地时非空）
+    llm_error: str = ""
     # 附加的结构化结果
     messages: List[MessageOut] = Field(default_factory=list)
     contacts: List[ContactOut] = Field(default_factory=list)
     todos: List[TodoOut] = Field(default_factory=list)
+
+
+class LLMTestResult(BaseModel):
+    """LLM 连通性测试结果。"""
+    ok: bool
+    provider: str = ""
+    model: str = ""
+    api_base: str = ""
+    response: str = ""
+    error: str = ""
+    config_hint: str = ""
 
 
 class AssistantHistoryResponse(BaseModel):
@@ -275,3 +288,13 @@ class DecryptTriggerResponse(BaseModel):
     msg_count: int = 0
     contact_count: int = 0
     db_results: List[DecryptDbResult] = Field(default_factory=list)
+
+
+class IncrementalDecryptResponse(BaseModel):
+    """增量同步结果：仅拉取本地库中已存在消息之后的新消息。"""
+
+    ok: bool
+    message: str
+    new_msg_count: int = 0
+    data_dir: str = ""
+    db_path: str = ""

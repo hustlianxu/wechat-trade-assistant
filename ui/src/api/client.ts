@@ -17,6 +17,7 @@ import type {
   AssistantHistoryResponse,
   SettingsResponse,
   LLMConfigRequest,
+  LLMTestResult,
   RealtimeListenRequest,
   ManualKeyRequest,
   ManualKeysJsonRequest,
@@ -24,6 +25,7 @@ import type {
   DecryptStatusResponse,
   DecryptTriggerRequest,
   DecryptTriggerResponse,
+  IncrementalDecryptResponse,
 } from '../types/api';
 
 // 后端 API 基地址：优先使用 preload 注入的地址，回退到默认本地地址
@@ -77,7 +79,7 @@ export const api = {
   getContactMessages: (
     id: number,
     p?: { start_ts?: number; end_ts?: number; msg_type?: string; limit?: number }
-  ) => request<MessageListResponse>(`/api/contacts/${id}/messages${qs(p)}`),
+  ) => request<MessageListResponse>(`/api/contacts/${id}/messages${qs(p || {})}`),
 
   // ===== 消息搜索 =====
   searchMessages: (body: SearchMessagesRequest) =>
@@ -146,6 +148,9 @@ export const api = {
   setLLM: (body: LLMConfigRequest) =>
     request<OkResponse>('/api/settings/llm', { method: 'POST', body: JSON.stringify(body) }),
   clearLLM: () => request<OkResponse>('/api/settings/llm', { method: 'DELETE' }),
+  /** 测试 LLM 连通性（无需先保存即可测试当前填写的配置）。 */
+  testLLM: (body: LLMConfigRequest) =>
+    request<LLMTestResult>('/api/llm/test', { method: 'POST', body: JSON.stringify(body) }),
   setRealtime: (body: RealtimeListenRequest) =>
     request<OkResponse>('/api/settings/realtime', {
       method: 'POST',
@@ -179,6 +184,11 @@ export const api = {
     request<DecryptTriggerResponse>('/api/decrypt/trigger', {
       method: 'POST',
       body: JSON.stringify(body),
+    }),
+  /** 手动触发一次增量同步：只拉取本地库中最新消息之后的新消息。 */
+  decryptIncremental: () =>
+    request<IncrementalDecryptResponse>('/api/decrypt/incremental', {
+      method: 'POST',
     }),
   resign: (body: ResignRequest) =>
     request<OkResponse>('/api/decrypt/resign', { method: 'POST', body: JSON.stringify(body) }),

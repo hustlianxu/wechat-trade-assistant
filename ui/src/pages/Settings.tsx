@@ -3,6 +3,8 @@ import { api } from '../api/client';
 import type {
   DecryptStatusResponse,
   DecryptTriggerResponse,
+  IncrementalDecryptResponse,
+  LLMTestResult,
   SettingsResponse,
 } from '../types/api';
 import Loading from '../components/Loading';
@@ -35,6 +37,12 @@ export default function Settings() {
   const [resignPwd, setResignPwd] = useState('');
   // 解密结果
   const [decryptResult, setDecryptResult] = useState<DecryptTriggerResponse | null>(null);
+  // 增量同步结果
+  const [incrementalResult, setIncrementalResult] = useState<IncrementalDecryptResponse | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  // LLM 测试
+  const [testingLLM, setTestingLLM] = useState(false);
+  const [llmTestResult, setLlmTestResult] = useState<LLMTestResult | null>(null);
 
   // 后端启动错误（由 preload 从 Electron 主进程传入）
   const backendError = (window.api?.backendError as string) || '';
@@ -103,6 +111,19 @@ export default function Settings() {
       .then((s) => setSettings(s))
       .catch((e) => showToast('清除失败：' + e.message))
       .finally(() => setBusy(false));
+  };
+
+  // 测试 LLM 连通性（无需先保存，直接用当前表单值测试）
+  const handleTestLLM = () => {
+    setTestingLLM(true);
+    setLlmTestResult(null);
+    api
+      .testLLM({ api_base: llmBase, api_key: llmKey, model: llmModel, timeout: 30 })
+      .then((r) => setLlmTestResult(r))
+      .catch((e) =>
+        setLlmTestResult({ ok: false, error: e instanceof Error ? e.message : String(e) })
+      )
+      .finally(() => setTestingLLM(false));
   };
 
   // 切换实时解析
@@ -186,6 +207,29 @@ export default function Settings() {
       })
       .catch((e) => showToast('解密失败：' + e.message))
       .finally(() => setBusy(false));
+  };
+
+  // 增量同步：仅拉取本地库中最新消息之后的新消息（无需重新解密联系人库）
+  const handleIncrementalSync = () => {
+    setSyncing(true);
+    setIncrementalResult(null);
+    api
+      .decryptIncremental()
+      .then((r) => {
+        setIncrementalResult(r);
+        showToast(r.message || (r.ok ? '增量同步完成' : '增量同步失败'));
+      })
+      .catch((e) => {
+        setIncrementalResult({
+          ok: false,
+          message: e instanceof Error ? e.message : String(e),
+          new_msg_count: 0,
+          data_dir: '',
+          db_path: '',
+        });
+        showToast('增量同步失败：' + (e instanceof Error ? e.message : String(e)));
+      })
+      .finally(() => setSyncing(false));
   };
 
   // macOS 重签名
@@ -390,6 +434,46 @@ export default function Settings() {
         ) : null}
       </div>
 
+      {/* 增量同步：仅拉取本地库中最新消息之后的新消息 */}
+      <div className="settings-section">
+        <div className="settings-section-title">增量同步</div>
+        <div className="muted text-sm" style={{ marginBottom: 8 }}>
+          只拉取本地库中已存在消息之后的新消息，不重新解密联系人库。
+          适合未开启实时监听时，手动点一下获取最新聊天记录。
+        </div>
+        <div className="settings-row">
+          <button
+            className="btn btn-primary"
+            disabled={busy || syncing}
+            onClick={handleIncrementalSync}
+          >
+            {syncing ? '同步中...' : '立即增量同步'}
+          </button>
+        </div>
+        {incrementalResult ? (
+          <div
+            className="kv-list"
+            style={{
+              marginTop: 8,
+              borderColor: incrementalResult.ok ? '#07C160' : '#FA5151',
+            }}
+          >
+            <div>结果：{incrementalResult.message}</div>
+            <div>新增消息：{incrementalResult.new_msg_count}</div>
+            {incrementalResult.data_dir ? (
+              <div className="muted text-sm" style={{ wordBreak: 'break-all' }}>
+                数据目录：{incrementalResult.data_dir}
+              </div>
+            ) : null}
+            {incrementalResult.db_path ? (
+              <div className="muted text-sm" style={{ wordBreak: 'break-all' }}>
+                消息库：{incrementalResult.db_path}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+
       {/* 实时解析开关 */}
       <div className="settings-section">
         <div className="settings-section-title">实时解析</div>
@@ -448,11 +532,43 @@ export default function Settings() {
             <button className="btn btn-primary" disabled={busy} onClick={handleSaveLLM}>
               保存
             </button>
+            <button className="btn" disabled={busy || testingLLM} onClick={handleTestLLM}>
+              {testingLLM ? '测试中...' : '测试连通性'}
+            </button>
             <button className="btn btn-danger" disabled={busy} onClick={handleClearLLM}>
               清除
             </button>
           </div>
         </div>
+        {llmTestResult ? (
+          <div
+            className={`llm-test-result ${llmTestResult.ok ? 'llm-test-result-ok' : 'llm-test-result-error'}`}
+          >
+            {llmTestResult.ok ? (
+              <>
+                <div className="llm-test-result-title">
+                  ✓ 连通成功{llmTestResult.model ? ` · ${llmTestResult.model}` : ''}
+                </div>
+                {llmTestResult.response ? (
+                  <div className="llm-test-result-detail">响应：{llmTestResult.response}</div>
+                ) : null}
+                {llmTestResult.api_base ? (
+                  <div className="llm-test-result-detail">api_base：{llmTestResult.api_base}</div>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <div className="llm-test-result-title">✗ 测试失败</div>
+                {llmTestResult.error ? (
+                  <div className="llm-test-result-detail">{llmTestResult.error}</div>
+                ) : null}
+                {llmTestResult.config_hint ? (
+                  <div className="llm-test-result-hint">💡 {llmTestResult.config_hint}</div>
+                ) : null}
+              </>
+            )}
+          </div>
+        ) : null}
       </div>
 
       {/* 单密钥区（3.x 或单一 key） */}
